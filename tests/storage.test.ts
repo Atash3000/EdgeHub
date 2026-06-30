@@ -43,7 +43,7 @@ describe("parquet round-trip — SECURITIES_SCHEMA", () => {
 });
 
 describe("parquet round-trip — SYMBOL_ALIASES_SCHEMA", () => {
-  it("writes an open alias row (validTo=null→undefined) and reads it back without throwing", async () => {
+  it("round-trips a symbol-aliases row with null validTo and reads back the fields", async () => {
     const raw = {
       instrumentId: "ID1",
       ticker: "AAA",
@@ -69,6 +69,8 @@ describe("parquet round-trip — SYMBOL_ALIASES_SCHEMA", () => {
     expect(read[0]!.instrumentId).toBe("ID1");
     expect(read[0]!.ticker).toBe("AAA");
     expect(read[0]!.validFrom).toBe("2026-06-30");
+    // parquetjs reads an absent optional column back as null (correct: open window => SQL NULL)
+    expect(read[0]!.validTo).toBeNull();
   });
 });
 
