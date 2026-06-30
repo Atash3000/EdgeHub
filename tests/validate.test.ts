@@ -20,4 +20,21 @@ describe("gradeBar", () => {
     const r = gradeBar({ ...base, volume: 0 }, new Set());
     expect(r.status).toBe("WARN"); expect(r.issues).toContain("zero_volume");
   });
+
+  it("rejects NaN open as invalid_ohlc", () => {
+    const r = gradeBar({ ...base, open: NaN }, new Set());
+    expect(r.status).toBe("REJECTED");
+    expect(r.issues).toContain("invalid_ohlc");
+  });
+  it("rejects high < low as inconsistent_ohlc", () => {
+    // high=5 < low=9, open=6, close=7 are all finite and positive
+    const r = gradeBar({ ...base, open: 6, high: 5, low: 9, close: 7 }, new Set());
+    expect(r.status).toBe("REJECTED");
+    expect(r.issues).toContain("inconsistent_ohlc");
+  });
+  it("rejects Infinity close as missing_close", () => {
+    const r = gradeBar({ ...base, close: Infinity }, new Set());
+    expect(r.status).toBe("REJECTED");
+    expect(r.issues).toContain("missing_close");
+  });
 });
