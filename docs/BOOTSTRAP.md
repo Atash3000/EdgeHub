@@ -36,11 +36,15 @@ aws iam attach-role-policy --role-name edgehub-deploy --policy-arn arn:aws:iam::
 
 Add the role ARN as GitHub repo **variable** `AWS_DEPLOY_ROLE_ARN` (Settings → Secrets and variables → Actions → Variables).
 
-## 2. Secret value
+## 2. SSM parameters
+
+The Finnhub key is already in SSM at `/edge-hunter/finnhub/api_key` (SecureString).
+
+Telegram is optional — to enable it, create the bot token at `/edge-hub/telegram/api-key` AND the chat id at `/edge-hub/telegram/chat_id` (both SecureString); if either is absent the daily report is written to CloudWatch Logs instead.
 
 ```bash
-aws secretsmanager put-secret-value --secret-id edgehub/secrets \
-  --secret-string '{"finnhubToken":"<FINNHUB>","telegramBotToken":"<BOT>","telegramChatId":"<CHAT_ID>"}'
+aws ssm put-parameter --name /edge-hub/telegram/api-key --type SecureString --value "<BOT_TOKEN>"
+aws ssm put-parameter --name /edge-hub/telegram/chat_id --type SecureString --value "<CHAT_ID>"
 ```
 
 ## 3. First backfill (after first successful deploy)
