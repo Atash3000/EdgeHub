@@ -2,7 +2,8 @@ import type { MarketDataProvider } from "./provider.js";
 import type { VendorBar, ProviderResult, ProviderFailure } from "../types.js";
 import { SOURCE_VERSION } from "../types.js";
 
-type FetchFn = (url: string) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
+type FetchInit = { headers: Record<string, string> };
+type FetchFn = (url: string, init?: FetchInit) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
 
 interface Agg { t: number; o: number; h: number; l: number; c: number; v: number; }
 interface AggResponse { status?: string; results?: Agg[]; }
@@ -45,8 +46,9 @@ export class PolygonProvider implements MarketDataProvider {
 
   private async get(url: string): Promise<unknown> {
     await this.limiter.wait(sleep, () => Date.now());
-    const res = await this.fetchFn(url);
-    if (!res.ok) throw new Error(`polygon HTTP ${res.status}`);
+    // Send the API key as a header, never in the URL/query string (avoids leaking it via logs/proxies).
+    const res = await this.fetchFn(url, { headers: { Authorization: `Bearer ${this.apiKey}` } });
+    if (!res.ok) throw new Error(`polygon HTTP ${res.status}`); // status only — never the URL
     return res.json();
   }
 
@@ -54,7 +56,7 @@ export class PolygonProvider implements MarketDataProvider {
     const end = endDate ?? new Date().toISOString().slice(0, 10);
     const fromMs = new Date(`${end}T00:00:00Z`).getTime() - Math.ceil(lookbackDays * 1.5) * 86400000;
     const from = new Date(fromMs).toISOString().slice(0, 10);
-    const url = `${BASE}/v2/aggs/ticker/${ticker}/range/1/day/${from}/${end}?adjusted=true&sort=asc&limit=50000&apiKey=${this.apiKey}`;
+    const url = `${BASE}/v2/aggs/ticker/${ticker}/range/1/day/${from}/${end}?adjusted=true&sort=asc&limit=50000`;
     try {
       const json = (await this.get(url)) as AggResponse;
       const at = new Date().toISOString();
@@ -66,7 +68,7 @@ export class PolygonProvider implements MarketDataProvider {
   }
 
   async getLatestBars(date: string, tickers: string[]): Promise<ProviderResult> {
-    const url = `${BASE}/v2/aggs/grouped/locale/us/market/stocks/${date}?adjusted=true&apiKey=${this.apiKey}`;
+    const url = `${BASE}/v2/aggs/grouped/locale/us/market/stocks/${date}?adjusted=true`;
     try {
       const json = (await this.get(url)) as GroupedResponse;
       const at = new Date().toISOString();
