@@ -6,7 +6,8 @@ Generated from `config/metrics.ts` (the metric registry). Add a metric there →
 
 | Column | Type | Meaning |
 |--------|------|---------|
-| ticker | string | Symbol |
+| instrumentId | string | Stable security id (FIGI-based, or `EH:` fallback) |
+| ticker | string | Symbol (as-traded on `date`) |
 | date | string | Trading day, YYYY-MM-DD |
 | open/high/low/close | double | OHLC (unadjusted) |
 | adjustedClose | double/null | Adjusted close; **null on Finnhub free tier** |
@@ -19,9 +20,29 @@ Generated from `config/metrics.ts` (the metric registry). Add a metric there →
 > **Adjustment caveat:** Part 1 stores **unadjusted** Finnhub candles (`isAdjusted=false`, `adjustedClose=null`).
 > Do not treat `close` as split/dividend-adjusted. True adjustment + corporate actions arrive in Part 2.
 
+> **Identity (Part 1.5a):** every raw bar and metric row now carries `instrumentId` — the stable
+> security id (FIGI-based, or an `EH:` fallback). `ticker` is the as-traded symbol for `date`.
+> Query continuous history by `instrumentId`; filter `schemaVersion = 'metrics_v2'` (or
+> `instrumentId IS NOT NULL`) to exclude pre-1.5a v1 rows.
+
+## securities (reference dimension, asOf-partitioned)
+
+One row per universe security per `asOf` day. `referenceStatus = FOUND` for real Polygon reference
+rows; `MISSING_FALLBACK` for rows EdgeHub minted (`EH:<ticker>`) because reference data was missing.
+Columns: instrumentId, ticker, tickerRoot/Suffix, name, market, locale, type, currencyName, cik,
+compositeFigi, shareClassFigi, primaryExchange, active, listDate, delistedUtc, lastUpdatedUtc,
+identitySource, identityConfidence, referenceStatus, source, sourceVersion, asOfDate, ingestedAt.
+
+## symbol_aliases (reference dimension, asOf-partitioned)
+
+Forward-only ticker↔instrument validity windows. One open row (`validTo = null`) per instrument;
+a rename closes the prior ticker (`validTo = previous trading day`) and opens the new one. Columns:
+instrumentId, ticker, tickerRoot/Suffix, primaryExchange, validFrom, validTo, source, sourceVersion,
+asOfDate, confidence, createdAt.
+
 ## daily_metrics
 
-Identity & provenance: ticker, date, runId, source, sourceVersion, schemaVersion, metricVersion, universeVersion.
+Identity & provenance: instrumentId, ticker, date, runId, source, sourceVersion, schemaVersion, metricVersion, universeVersion.
 
 | Metric | Window | Depends on | Meaning |
 |--------|--------|-----------|---------|
