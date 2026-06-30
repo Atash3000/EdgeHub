@@ -24,6 +24,9 @@ Generated from `config/metrics.ts` (the metric registry). Add a metric there →
 > security id (FIGI-based, or an `EH:` fallback). `ticker` is the as-traded symbol for `date`.
 > Query continuous history by `instrumentId`; filter `schemaVersion = 'metrics_v2'` (or
 > `instrumentId IS NOT NULL`) to exclude pre-1.5a v1 rows.
+> The history cache was re-keyed from `ticker=` to `instrumentId=`, so the first daily run after
+> deploy re-backfills each ticker once (a one-time cache-miss burst) and leaves orphaned `ticker=`
+> cache objects behind — self-healing, no data loss.
 
 ## securities (reference dimension, asOf-partitioned)
 

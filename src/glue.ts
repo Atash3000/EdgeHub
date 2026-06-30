@@ -34,7 +34,7 @@ export async function addAsOfPartition(glue: GlueClient, database: string, table
       PartitionInputList: [{ Values: [asOf], StorageDescriptor: storageDescriptor }],
     }));
   } catch (err) {
-    if (((err as { name?: string }).name ?? "").includes("AlreadyExists")) return;
+    if (((err as { name?: string }).name ?? "").includes("AlreadyExists")) return; // idempotent
     throw err;
   }
 }

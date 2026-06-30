@@ -1,6 +1,5 @@
 import { describe, it, expect } from "vitest";
 import { mapAgg, PolygonProvider } from "../src/providers/polygon.js";
-import type { SecurityMasterRow } from "../src/types.js";
 
 describe("mapAgg", () => {
   it("maps an aggregate result to VendorBar", () => {

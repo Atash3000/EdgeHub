@@ -1,7 +1,7 @@
 import { S3Client } from "@aws-sdk/client-s3";
 import { GlueClient } from "@aws-sdk/client-glue";
 import type { MarketDataProvider } from "./providers/provider.js";
-import type { VendorBar, ResolvedVendorBar, RawBarRow, MetricRow, RunManifest, RunMode, Provenance, ErrorRecord, SecurityMasterRow } from "./types.js";
+import type { VendorBar, ResolvedVendorBar, RawBarRow, MetricRow, RunManifest, RunMode, Provenance, ErrorRecord } from "./types.js";
 import { SCHEMA_VERSION, RAW_SCHEMA_VERSION, METRIC_VERSION } from "./types.js";
 import { loadUniverse } from "./universe.js";
 import { gradeBar } from "./validate.js";
