@@ -6,7 +6,7 @@ Globals:
   Function:
     Timeout: 900
     MemorySize: 1024
-    Runtime: nodejs22.x
+    Runtime: nodejs24.x
 
 Resources:
   DataBucket:
@@ -55,7 +55,7 @@ Resources:
       BuildMethod: esbuild
       BuildProperties:
         Format: esm
-        Target: node20
+        Target: node24
         EntryPoints: [src/handler.ts]
 
   SchedulerRole:
