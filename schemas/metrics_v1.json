@@ -1,0 +1,17 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "metrics_v1",
+  "type": "object",
+  "required": ["ticker", "date", "close", "qualityStatus", "runId", "schemaVersion", "metricVersion", "universeVersion"],
+  "properties": {
+    "ticker": { "type": "string" },
+    "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "close": { "type": "number" },
+    "qualityStatus": { "type": "string", "enum": ["OK", "WARN", "REJECTED"] },
+    "qualityIssues": { "type": "string", "description": "JSON-encoded string array" },
+    "runId": { "type": "string" },
+    "schemaVersion": { "type": "string" },
+    "metricVersion": { "type": "string" },
+    "universeVersion": { "type": "string" }
+  }
+}

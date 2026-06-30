@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "dailyBars_v1",
+  "type": "object",
+  "required": ["ticker", "date", "open", "high", "low", "close", "isAdjusted", "volume", "source", "sourceVersion", "ingestedAt", "runId", "schemaVersion", "metricVersion", "universeVersion"],
+  "properties": {
+    "ticker": { "type": "string" },
+    "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+    "open": { "type": "number" },
+    "high": { "type": "number" },
+    "low": { "type": "number" },
+    "close": { "type": "number" },
+    "adjustedClose": { "type": ["number", "null"] },
+    "isAdjusted": { "type": "boolean" },
+    "volume": { "type": "number" },
+    "source": { "type": "string" },
+    "sourceVersion": { "type": "string" },
+    "ingestedAt": { "type": "string" },
+    "runId": { "type": "string" },
+    "schemaVersion": { "type": "string" },
+    "metricVersion": { "type": "string" },
+    "universeVersion": { "type": "string" }
+  }
+}
