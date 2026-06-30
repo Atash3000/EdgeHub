@@ -26,4 +26,17 @@ describe("selectConfig", () => {
     expect(result.telegramBotToken).toBe("bot");
     expect(result.telegramChatId).toBe("123");
   });
+
+  it("includes polygonToken when polygon api key is present", () => {
+    const result = selectConfig(
+      [
+        { Name: "/edge-hunter/finnhub/api_key", Value: "abc" },
+        { Name: "/edge-hub/telegram/api-key", Value: "bot" },
+        { Name: "/edge-hub/telegram/chat-id", Value: "123" },
+        { Name: "/global/polygon/api-key", Value: "polykey" },
+      ],
+      DEFAULT_PARAM_NAMES
+    );
+    expect(result.polygonToken).toBe("polykey");
+  });
 });
