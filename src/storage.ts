@@ -1,0 +1,68 @@
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import { ParquetSchema, ParquetWriter } from "@dsnp/parquetjs";
+import type { RawBarRow, MetricRow } from "./types.js";
+
+function parts(date: string): { year: string; month: string; day: string } {
+  const [year, month, day] = date.split("-") as [string, string, string];
+  return { year, month, day };
+}
+export function rawKey(source: string, date: string, runId: string): string {
+  const { year, month, day } = parts(date);
+  return `raw/${source}/daily/year=${year}/month=${month}/day=${day}/runId=${runId}/part.parquet`;
+}
+export function metricsKey(date: string, runId: string): string {
+  const { year, month, day } = parts(date);
+  return `metrics/daily/year=${year}/month=${month}/day=${day}/runId=${runId}/part.parquet`;
+}
+
+export const RAW_SCHEMA = new ParquetSchema({
+  ticker: { type: "UTF8" }, date: { type: "UTF8" },
+  open: { type: "DOUBLE" }, high: { type: "DOUBLE" }, low: { type: "DOUBLE" }, close: { type: "DOUBLE" },
+  adjustedClose: { type: "DOUBLE", optional: true }, isAdjusted: { type: "BOOLEAN" },
+  volume: { type: "DOUBLE" },
+  source: { type: "UTF8" }, sourceVersion: { type: "UTF8" }, ingestedAt: { type: "UTF8" },
+  runId: { type: "UTF8" }, schemaVersion: { type: "UTF8" }, metricVersion: { type: "UTF8" }, universeVersion: { type: "UTF8" },
+});
+
+export const METRIC_SCHEMA = new ParquetSchema({
+  ticker: { type: "UTF8" }, date: { type: "UTF8" }, close: { type: "DOUBLE" }, dollarVolume: { type: "DOUBLE" },
+  ma20: { type: "DOUBLE", optional: true }, ma50: { type: "DOUBLE", optional: true },
+  ma150: { type: "DOUBLE", optional: true }, ma200: { type: "DOUBLE", optional: true },
+  avgVolume20: { type: "DOUBLE", optional: true }, avgVolume50: { type: "DOUBLE", optional: true },
+  atr14: { type: "DOUBLE", optional: true },
+  high52w: { type: "DOUBLE", optional: true }, low52w: { type: "DOUBLE", optional: true },
+  distanceTo52wHighPct: { type: "DOUBLE", optional: true }, distanceFrom52wLowPct: { type: "DOUBLE", optional: true },
+  return21d: { type: "DOUBLE", optional: true }, return63d: { type: "DOUBLE", optional: true },
+  return126d: { type: "DOUBLE", optional: true }, return252d: { type: "DOUBLE", optional: true },
+  above20ma: { type: "BOOLEAN", optional: true }, above50ma: { type: "BOOLEAN", optional: true },
+  above150ma: { type: "BOOLEAN", optional: true }, above200ma: { type: "BOOLEAN", optional: true },
+  ma150Above200: { type: "BOOLEAN", optional: true }, ma200Rising: { type: "BOOLEAN", optional: true },
+  qualityStatus: { type: "UTF8" }, qualityIssues: { type: "UTF8" },
+  runId: { type: "UTF8" }, ingestedAt: { type: "UTF8" }, source: { type: "UTF8" }, sourceVersion: { type: "UTF8" },
+  schemaVersion: { type: "UTF8" }, metricVersion: { type: "UTF8" }, universeVersion: { type: "UTF8" },
+});
+
+export async function toParquet(schema: ParquetSchema, rows: Record<string, unknown>[]): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  const writer = await ParquetWriter.openStream(schema, {
+    write: (c: Buffer) => chunks.push(c), end: () => {},
+  } as never);
+  for (const row of rows) await writer.appendRow(row);
+  await writer.close();
+  return Buffer.concat(chunks);
+}
+
+export async function writeRaw(s3: S3Client, bucket: string, rows: RawBarRow[], source: string, date: string, runId: string): Promise<string> {
+  const key = rawKey(source, date, runId);
+  const body = await toParquet(RAW_SCHEMA, rows as unknown as Record<string, unknown>[]);
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
+  return key;
+}
+
+export async function writeMetrics(s3: S3Client, bucket: string, rows: MetricRow[], date: string, runId: string): Promise<string> {
+  const key = metricsKey(date, runId);
+  const flat = rows.map((r) => ({ ...r, qualityIssues: JSON.stringify(r.qualityIssues) })); // JSON string, not comma-joined
+  const body = await toParquet(METRIC_SCHEMA, flat as unknown as Record<string, unknown>[]);
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
+  return key;
+}
