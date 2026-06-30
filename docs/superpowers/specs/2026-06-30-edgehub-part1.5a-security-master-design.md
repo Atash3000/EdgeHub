@@ -282,6 +282,14 @@ minting lives in one place). Rate-limit cost: ~9 calls ≈ ~2 min added to the d
 
 ~6 minutes of cost at full-catalog scale is explicitly **not** paid in 1.5a (D1).
 
+> **⚠️ Reference-call scaling warning.** This per-ticker reference method is a 1.5a-only strategy and
+> **must not be scaled to large universes.** At Polygon's 5 req/min limit: ~9 tickers ≈ 2 min (fine),
+> ~50 tickers ≈ 10 min (slow), ~500 tickers ≈ 100 min (**exceeds the 900s Lambda timeout — broken**).
+> The Lambda timeout is already 900s (`template.yaml`), comfortably enough for today's 9 tickers. When
+> the universe grows toward full S&P 500 / Nasdaq 100, **switch to the full-catalog `listSecurities`
+> path** (one paginated `?date=` sweep, ~30 pages, fixed cost regardless of N) — that is the
+> deferred Part 1.5b/dynamic-universe work, not a tweak to this per-ticker method.
+
 ### 7.3 Fake (`src/providers/fake.ts`)
 
 `FakeProvider` gains `listSecurities` returning canned `SecurityMasterRow[]` (constructor takes an
@@ -365,13 +373,13 @@ steps run **after** the calendar gate + universe load and **before** the per-tic
 ```
 calendar gate (unchanged)
 universe load (unchanged)
-snapshotUniverse(...)                       ← now stores securities (see §11)
 ── NEW ──────────────────────────────────────────────
 listSecurities(effectiveDate, tickers)
 buildSecurityMaster(...)  → mint EH: fallbacks (§4) → writeSecurities
 readLatestSecurities(...) → identity_changed guard
 buildSymbolAliases(...)   → writeSymbolAliases
 buildTickerMap(...)       → resolveBarsToInstruments(fetched bars)
+snapshotUniverse(...)     ← AFTER the master, so it includes instrumentId (§11); written once
 ── END NEW ──────────────────────────────────────────
 per-ticker loop (unchanged EXCEPT):
   • history cache keyed by instrumentId   (§12)
@@ -410,10 +418,9 @@ report (+ resolution stats)
 ```
 
 The committed `config/universe/*.json` files are **unchanged** and remain the source of truth for
-which tickers we ingest (D1). The snapshot is produced after the master is built so it can include
-`instrumentId`. (If you prefer to keep `snapshotUniverse` before `listSecurities`, write the snapshot
-twice or thread the resolved securities in — the implementation plan will pick the cleaner ordering;
-the **stored shape** above is what matters.)
+which tickers we ingest (D1). **`snapshotUniverse` runs AFTER `buildSecurityMaster`** (see §10), so
+the snapshot can include `instrumentId` and is written exactly **once** — do not snapshot first and
+rewrite.
 
 ---
 
