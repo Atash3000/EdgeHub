@@ -6,7 +6,7 @@ import { getProvider } from "./providers/factory.js";
 import { loadSecrets } from "./secrets.js";
 import { runPipeline } from "./pipeline.js";
 import { readHistoryCache, writeHistoryCache } from "./historyCache.js";
-import { isTradingDay, calendarCoversYear } from "./calendar.js";
+import { isTradingDay, calendarCoversYear, previousTradingDay } from "./calendar.js";
 import { renderReport, sendTelegram } from "./report.js";
 
 export function parseEvent(event: { mode?: string; tradingDay?: string }, now: Date): { mode: RunMode; tradingDay: string } {
@@ -35,9 +35,14 @@ export async function handler(event: { mode?: string; tradingDay?: string } = {}
     readHistory: (t) => readHistoryCache(s3, bucket, provider.name, t),
     writeHistory: (t, bars) => writeHistoryCache(s3, bucket, provider.name, t, bars),
     isTradingDay: (d) => isTradingDay(d),
+    previousTradingDay: (d) => previousTradingDay(d),
     calendarCovers: (d) => calendarCoversYear(d),
   });
 
-  await sendTelegram(secrets.telegramBotToken!, secrets.telegramChatId!, renderReport(manifest));
+  try {
+    await sendTelegram(secrets.telegramBotToken!, secrets.telegramChatId!, renderReport(manifest));
+  } catch (err) {
+    console.error("telegram notification failed (ingestion already completed):", (err as Error).message);
+  }
   return { status: manifest.status };
 }

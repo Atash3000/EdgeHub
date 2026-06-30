@@ -5,5 +5,5 @@ export interface MarketDataProvider {
   readonly version: string;
   /** Returns bars whose date === the requested date (never a stale bar) plus a failure per missing/errored ticker. */
   getLatestBars(date: string, tickers: string[]): Promise<ProviderResult>;
-  getHistory(ticker: string, lookbackDays: number): Promise<ProviderResult>;
+  getHistory(ticker: string, lookbackDays: number, endDate?: string): Promise<ProviderResult>;
 }

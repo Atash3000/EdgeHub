@@ -17,7 +17,9 @@ export class FakeProvider implements MarketDataProvider {
     return { bars, failures };
   }
 
-  async getHistory(ticker: string, lookbackDays: number): Promise<ProviderResult> {
-    return { bars: (this.history.get(ticker) ?? []).slice(-lookbackDays), failures: [] };
+  async getHistory(ticker: string, lookbackDays: number, endDate?: string): Promise<ProviderResult> {
+    let bars = this.history.get(ticker) ?? [];
+    if (endDate) bars = bars.filter((b) => b.date <= endDate);
+    return { bars: bars.slice(-lookbackDays), failures: [] };
   }
 }

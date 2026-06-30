@@ -7,16 +7,20 @@ type FetchFn = (url: string) => Promise<{ ok: boolean; status: number; json: () 
 
 export function mapCandle(symbol: string, raw: unknown, ingestedAt: string): VendorBar[] {
   const json = raw as FinnhubCandle;
-  if (!json || json.s !== "ok" || !json.t) return [];
+  if (!json || json.s !== "ok" || !Array.isArray(json.t)) return [];
+  const n = json.t.length;
+  const cols = [json.o, json.h, json.l, json.c, json.v];
+  if (cols.some((a) => !Array.isArray(a) || a.length !== n)) return []; // uneven/missing arrays -> no usable data
   const bars: VendorBar[] = [];
-  for (let i = 0; i < json.t.length; i++) {
+  for (let i = 0; i < n; i++) {
+    const o = json.o![i], h = json.h![i], l = json.l![i], c = json.c![i], v = json.v![i], t = json.t[i];
+    if (![o, h, l, c, v, t].every((x) => typeof x === "number" && Number.isFinite(x))) continue; // skip malformed bar
     bars.push({
       ticker: symbol,
-      date: new Date(json.t[i]! * 1000).toISOString().slice(0, 10),
-      open: json.o![i]!, high: json.h![i]!, low: json.l![i]!, close: json.c![i]!,
-      adjustedClose: null,   // Finnhub free candles are unadjusted; never fabricate this
-      isAdjusted: false,
-      volume: json.v![i]!,
+      date: new Date(t! * 1000).toISOString().slice(0, 10),
+      open: o!, high: h!, low: l!, close: c!,
+      adjustedClose: null, isAdjusted: false,
+      volume: v!,
       source: "finnhub", sourceVersion: SOURCE_VERSION, ingestedAt,
     });
   }
@@ -71,13 +75,15 @@ export class FinnhubProvider implements MarketDataProvider {
     return { bars, failures }; // one bad ticker never aborts the batch
   }
 
-  async getHistory(ticker: string, lookbackDays: number): Promise<ProviderResult> {
-    const to = Math.floor(Date.now() / 1000);
+  async getHistory(ticker: string, lookbackDays: number, endDate?: string): Promise<ProviderResult> {
+    const to = endDate
+      ? Math.floor(new Date(`${endDate}T23:59:59Z`).getTime() / 1000)
+      : Math.floor(Date.now() / 1000);
     const from = to - Math.ceil(lookbackDays * 1.5) * 86400; // pad for weekends/holidays
     try {
       return { bars: await this.candle(ticker, from, to), failures: [] };
     } catch (err) {
-      return { bars: [], failures: [{ ticker, date: "", reason: "provider_error", message: (err as Error).message }] };
+      return { bars: [], failures: [{ ticker, date: endDate ?? "", reason: "provider_error", message: (err as Error).message }] };
     }
   }
 }

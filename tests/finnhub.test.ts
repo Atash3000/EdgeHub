@@ -15,6 +15,10 @@ describe("mapCandle", () => {
   it("returns [] when status is not ok", () => {
     expect(mapCandle("AAPL", { s: "no_data" }, "x")).toEqual([]);
   });
+  it("returns [] when arrays are uneven (missing/short column)", () => {
+    // t has 2 entries but o/h/l/c/v only have 1 — uneven arrays should return no bars
+    expect(mapCandle("AAPL", { s: "ok", t: [1, 2], o: [1], h: [2], l: [1], c: [1], v: [1] }, "x")).toEqual([]);
+  });
 });
 
 describe("FinnhubProvider.getLatestBars", () => {
