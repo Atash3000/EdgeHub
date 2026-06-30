@@ -5,8 +5,8 @@ import type { VendorBar } from "../src/types.js";
 const bar = (date: string): VendorBar => ({ ticker: "AAPL", date, open: 1, high: 1, low: 1, close: 1, adjustedClose: null, isAdjusted: false, volume: 1, source: "finnhub", sourceVersion: "1.0", ingestedAt: "x" });
 
 describe("historyCacheKey", () => {
-  it("builds the per-ticker key", () => {
-    expect(historyCacheKey("finnhub", "AAPL")).toBe("history/finnhub/ticker=AAPL/current.json");
+  it("builds the per-instrument key", () => {
+    expect(historyCacheKey("polygon", "BBG000B9XRY4")).toBe("history/polygon/instrumentId=BBG000B9XRY4/current.json");
   });
 });
 
