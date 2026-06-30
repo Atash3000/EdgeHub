@@ -90,10 +90,20 @@ The same Lambda supports two modes, selected by event payload (`{"mode": "daily"
 
 - **Backfill (manual / one-time / new ticker):** fetch **300–400 trading days** per ticker.
   Used on first setup and automatically for any ticker that has insufficient stored history.
-- **Daily (scheduled):** fetch **only the latest daily bar** per ticker, then read trailing history
-  from S3 (`history.ts`) to compute MA200, ATR14, 52-week stats, and multi-month returns.
-- **Auto-backfill fallback:** during a daily run, if `history.ts` finds a ticker lacks enough
-  trailing bars (new constituent, or gap), the pipeline fetches a lookback window for that ticker only.
+- **Daily (scheduled):** fetch **only the latest daily bar** per ticker, then read trailing history from
+  the **per-ticker history cache** to compute MA200, ATR14, 52-week stats, and multi-month returns.
+- **Auto-backfill fallback:** during a daily run, if a ticker lacks enough trailing bars (new constituent,
+  or gap), the pipeline fetches a lookback window for that ticker only.
+
+**History cache:** instead of scanning 200+ date partitions per ticker, each ticker's trailing ~400 bars
+live at `history/<source>/ticker=<T>/current.json`. Each daily run reads the cache, appends today's bar,
+computes metrics, and rewrites the cache. The cache is **rebuildable from the immutable raw partitions**,
+which remain the source of truth — so this is an index/cache, not a second source of truth.
+
+**Calendar gate:** a minimal market calendar (`calendar.ts` + committed `config/calendar/holidays.json`)
+provides `isTradingDay` / `previousTradingDay`. The scheduled daily run **skips non-trading days**
+(manifest `SKIPPED`, `current` not advanced) so holidays don't produce garbage failures. (A full exchange
+calendar is Part 2.)
 
 This keeps daily runs fast and within provider rate limits, while still producing full metrics.
 
@@ -105,14 +115,25 @@ No code outside `providers/` knows which vendor is in use. The rest of the pipel
 `MarketDataProvider` interface.
 
 ```ts
-// providers/provider.ts
+// providers/provider.ts — providers return VendorBar (vendor data only, no provenance)
 export interface MarketDataProvider {
   readonly name: string;                 // e.g. "finnhub" — drives the raw/<source>/ path
   readonly version: string;              // reported sourceVersion
-  getLatestBars(date: string, tickers: string[]): Promise<RawBar[]>;
-  getHistory(ticker: string, lookbackDays: number): Promise<RawBar[]>;
+  getLatestBars(date: string, tickers: string[]): Promise<VendorBar[]>; // exact-date only, no stale fallback
+  getHistory(ticker: string, lookbackDays: number): Promise<VendorBar[]>;
 }
 ```
+
+**Provider output vs stored row:** a provider returns `VendorBar` (vendor fields only). The pipeline
+enriches each into a `RawBarRow` (= `VendorBar` + full provenance: `runId, schemaVersion, metricVersion,
+universeVersion`) before writing. Providers never know `runId`/`universeVersion`.
+
+**Adjustment honesty:** `VendorBar` carries `adjustedClose: number | null` + `isAdjusted: boolean`.
+Finnhub free candles are unadjusted, so we store `adjustedClose=null, isAdjusted=false` — we never
+fabricate an adjusted price. (True adjustment + corporate actions are Part 2.)
+
+**No stale substitution:** if the exact `tradingDay` bar is absent, the pipeline records a per-ticker
+`missing_bar_for_date` failure and writes no row for that ticker — yesterday's bar is never relabeled as today.
 
 - `providers/factory.ts` returns the active impl based on the `DATA_PROVIDER` config value
   (default `finnhub`); the concrete file (`finnhub.ts`, later `polygon.ts` / `tiingo.ts`) is an
@@ -186,11 +207,14 @@ metadata/runs/year=2026/month=06/day=29/runId=.../manifest.json
 metadata/universe/2026-06-29.json                              -> resolved universe snapshot
 reports/year=2026/month=06/day=29/runId=.../report.json
 errors/year=2026/month=06/day=29/runId=.../errors.json
+history/<source>/ticker=<T>/current.json   (per-ticker trailing-bar cache, rebuildable)
 labels/              (reserved, Part 2)
 corporate_actions/   (reserved, Part 2)
 ```
 
 - A re-run on the same day produces a **new `runId`**, never overwriting the prior run's data.
+- `metadata/current` advances **only on `SUCCESS` or an accepted `PARTIAL`** (success rate ≥ floor) —
+  never on `FAILURE` or `SKIPPED`, so a newer bad/holiday run can't become authoritative.
 - Glue partitions point at the date partition; consumers resolve the authoritative run via the
   `metadata/current` pointer. (Part 1 keeps partitioning **date-only**; a ticker partition or compacted
   history is a future optimization if Athena ticker-scans get slow.)
@@ -277,7 +301,8 @@ The universe changes over time (index reconstitutions, watchlist edits). For a b
 - **OK** — passes all checks.
 
 Every failure/warning is recorded in `errors/...runId.../errors.json` and counted in the manifest.
-Nothing is silently dropped.
+`qualityIssues` is stored as a **JSON-encoded string array** (not comma-joined), so issue codes parse
+cleanly downstream. Nothing is silently dropped.
 
 ---
 
@@ -323,8 +348,8 @@ Created/structured now so later work needs no migration, but **explicitly out of
 
 - `labels/` — forward-return labels (30dReturn, 90dReturn, 2R, etc.).
 - `corporate_actions/` — splits, dividends, symbol changes.
-- **Market calendar** — trading-day / holiday / half-day awareness (Part 1 trusts the Scheduler + the
-  provider's returned dates; a real calendar is Part 2).
+- **Full exchange calendar** — Part 1 ships a *minimal* static calendar (`config/calendar/holidays.json`)
+  that gates the daily run; half-days and a real exchange-calendar source are Part 2.
 - **Scale-out to Step Functions** — when the universe grows toward Russell 1000/3000, the modular step
   structure lifts into Step Functions (Map-state fan-out, per-step retry) without rewriting business logic.
 - **Vision (not scope): "historical memory" / similarity search** — with versioned metrics across history,

@@ -4,23 +4,28 @@
 
 **Goal:** Build a serverless daily pipeline that downloads US equity OHLCV, computes versioned market metrics, stores them as partitioned Parquet in S3, catalogs them in Glue for Athena, and reports health via Telegram — deployed to AWS exclusively from GitHub.
 
-**Architecture:** A single, internally-modular TypeScript Lambda (`edgehub-daily-collector`) runs the pipeline (universe → download → validate → store raw → compute metrics → store metrics → Glue partition → manifest → Telegram). EventBridge Scheduler triggers it daily at 6:30 PM America/New_York. Infrastructure is defined with AWS SAM and deployed via GitHub Actions using OIDC. The market-data vendor sits behind a `MarketDataProvider` interface; nothing vendor-specific is hardcoded.
+**Architecture:** A single, internally-modular TypeScript Lambda (`edgehub-daily-collector`) runs the pipeline (calendar check → universe → download → validate → store raw → compute metrics → store metrics → Glue partition → manifest → Telegram). EventBridge Scheduler triggers it daily at 6:30 PM America/New_York. Infrastructure is AWS SAM, deployed via GitHub Actions using OIDC. The vendor sits behind a `MarketDataProvider` interface returning `VendorBar`s; the pipeline enriches them with provenance into `RawBarRow`s.
 
-**Tech Stack:** TypeScript, Node.js 20, AWS SAM, AWS SDK v3 (S3/Glue/Secrets Manager), `@dsnp/parquetjs`, Vitest (tests), GitHub Actions.
+**Tech Stack:** TypeScript, Node.js 20, AWS SAM, AWS SDK v3 (S3/Glue/Secrets Manager), `@dsnp/parquetjs`, Vitest, GitHub Actions.
 
 ## Global Constraints
 
-- Runtime: **Node.js 20**, TypeScript compiled/bundled by SAM esbuild.
-- Region: **us-east-1**. Stack name: **edgehub**. Bucket: **edgehub-data**.
-- Derived data is named **metrics** (never "features"): dir `metrics/`, Glue table `daily_metrics`, field `metricVersion`, env `METRIC_VERSION`.
-- Version constants: `SCHEMA_VERSION = "metrics_v1"`, `METRIC_VERSION = "1.0"`, `SOURCE_VERSION = "1.0"`.
-- Active vendor selected by env `DATA_PROVIDER` (default `finnhub`). The `source` path segment and `source`/`sourceVersion` fields come from `provider.name`/`provider.version` — never a literal.
-- Every raw row, metric row, report, and error file carries provenance: `runId, ingestedAt, source, sourceVersion, schemaVersion, metricVersion, universeVersion`.
-- Immutability: every write goes under `runId=<UTC timestamp>`; the authoritative run is recorded in `metadata/current/` (never overwrite history; never advance `current` on failure).
-- Quality: rows are graded `OK | WARN | REJECTED`; WARN rows are stored, REJECTED rows are excluded and logged to `errors/`. Nothing is silently dropped.
-- Deploys happen **only** from GitHub Actions on push to `main` via OIDC. No laptop deploys.
-- `labels/` and `corporate_actions/` are reserved (created, unused) for Part 2.
-- TDD: write the failing test first, watch it fail, implement minimally, watch it pass, commit.
+- Runtime: **Node.js 20**, TypeScript bundled by SAM esbuild.
+- Region: **us-east-1**. Stack: **edgehub**. Bucket: **edgehub-data**.
+- Derived data is **metrics** (never "features"): dir `metrics/`, table `daily_metrics`, field `metricVersion`, env `METRIC_VERSION`.
+- Version constants: `SCHEMA_VERSION = "metrics_v1"`, `RAW_SCHEMA_VERSION = "dailyBars_v1"`, `METRIC_VERSION = "1.0"`, `SOURCE_VERSION = "1.0"`.
+- Active vendor via env `DATA_PROVIDER` (default `finnhub`). `source`/`sourceVersion` come from `provider.name`/`provider.version` — never a literal.
+- **Provider returns `VendorBar` (vendor data only). The pipeline enriches to `RawBarRow` with full provenance** (`runId, ingestedAt, source, sourceVersion, schemaVersion, metricVersion, universeVersion`) before writing. Providers never know `runId`/`universeVersion`.
+- Every raw row, metric row, report, and error file carries full provenance.
+- **Never fabricate adjusted prices.** `adjustedClose: number | null` + `isAdjusted: boolean`. Finnhub free candles → `adjustedClose=null, isAdjusted=false`.
+- **Never substitute a stale bar for a missing day.** If the exact `tradingDay` bar is absent, record a per-ticker `missing_bar_for_date` failure and write no today row.
+- **Market calendar gates daily runs.** Non-trading days are skipped (manifest `SKIPPED`), not processed.
+- Immutability: every write under `runId=<UTC timestamp>`. Authoritative run recorded in `metadata/current/`, advanced only on `SUCCESS` or accepted `PARTIAL` (success rate ≥ floor) — never on `FAILURE`/`SKIPPED`.
+- **History cache**: per-ticker trailing bars at `history/{source}/ticker={t}/current.json`, rebuildable from immutable raw (which remains the source of truth).
+- Quality: `OK | WARN | REJECTED`; WARN stored, REJECTED excluded + logged to `errors/`. `qualityIssues` stored as a **JSON string**. Nothing silently dropped.
+- Deploys only from GitHub Actions on push to `main` via OIDC. No laptop deploys.
+- `labels/` and `corporate_actions/` are reserved (unused) for Part 2. No trading/strategy/AI logic in Part 1.
+- TDD: failing test → watch it fail → minimal impl → watch it pass → commit.
 
 ---
 
@@ -29,25 +34,23 @@
 | File | Responsibility |
 |------|----------------|
 | `package.json`, `tsconfig.json`, `vitest.config.ts` | Project + test setup |
-| `src/types.ts` | Shared types + version constants |
-| `config/metrics.ts` | Metric registry (single source of truth) |
+| `src/types.ts` | Shared types (`VendorBar`, `RawBarRow`, `MetricRow`, `RunManifest`, `Provenance`) + constants |
+| `config/metrics.ts` | Metric registry |
 | `schemas/dailyBars_v1.json`, `schemas/metrics_v1.json` | Schema registry |
-| `config/universe/*.json` | Versioned ticker universe |
-| `src/universe.ts` | Load/merge/dedupe universe + version |
-| `src/providers/provider.ts` | `MarketDataProvider` interface |
-| `src/providers/factory.ts` | Select active provider by `DATA_PROVIDER` |
-| `src/providers/finnhub.ts` | Finnhub implementation (rate-limited) |
-| `src/providers/fake.ts` | In-memory provider for tests/local |
-| `src/validate.ts` | Quality grading (OK/WARN/REJECTED) |
-| `src/metrics.ts` | Compute metrics from bars + registry |
-| `src/history.ts` | Read trailing bars from S3 |
-| `src/storage.ts` | Write raw/metric Parquet to S3 |
-| `src/glue.ts` | Add Glue partitions |
+| `config/calendar/holidays.json`, `src/calendar.ts` | Market calendar |
+| `config/universe/*.json`, `src/universe.ts` | Versioned universe |
+| `src/providers/provider.ts` / `factory.ts` / `finnhub.ts` / `fake.ts` | Vendor abstraction |
+| `src/validate.ts` | Quality grading |
+| `src/metrics.ts` | Metric computation (quality injected) |
+| `src/secrets.ts` | Secrets Manager loader |
+| `src/storage.ts` | Raw/metric Parquet writers + path builders |
+| `src/history.ts` | Merge logic + sufficiency check |
+| `src/historyCache.ts` | Per-ticker trailing-bar cache I/O |
+| `src/glue.ts` | Glue partition registration |
 | `src/metadata.ts` | Manifest + current pointer + universe snapshot |
 | `src/report.ts` | Telegram report |
-| `src/secrets.ts` | Fetch secrets from Secrets Manager |
-| `src/pipeline.ts` | Orchestrate steps, own `runId`, build manifest |
-| `src/handler.ts` | Lambda entrypoint (parse mode, call pipeline) |
+| `src/pipeline.ts` | Orchestration, runId, manifest, current policy |
+| `src/handler.ts` | Lambda entrypoint |
 | `template.yaml`, `samconfig.toml` | SAM infra + deploy config |
 | `.github/workflows/ci.yml`, `deploy.yml` | CI + CD |
 | `docs/DATA_DICTIONARY.md`, `docs/BOOTSTRAP.md` | Docs |
@@ -56,11 +59,9 @@
 
 ## Task 1: Project scaffolding
 
-**Files:**
-- Create: `package.json`, `tsconfig.json`, `vitest.config.ts`, `.gitignore`
+**Files:** Create `package.json`, `tsconfig.json`, `vitest.config.ts`, `.gitignore`
 
-**Interfaces:**
-- Produces: `npm test`, `npm run typecheck`, `npm run build` scripts used by all later tasks and CI.
+**Interfaces:** Produces `npm test`, `npm run typecheck`, `npm run build` used by all later tasks + CI.
 
 - [ ] **Step 1: Create `package.json`**
 
@@ -118,10 +119,7 @@
 
 ```ts
 import { defineConfig } from "vitest/config";
-
-export default defineConfig({
-  test: { include: ["tests/**/*.test.ts"], environment: "node" },
-});
+export default defineConfig({ test: { include: ["tests/**/*.test.ts"], environment: "node" } });
 ```
 
 - [ ] **Step 4: Create `.gitignore`**
@@ -133,10 +131,7 @@ dist/
 *.log
 ```
 
-- [ ] **Step 5: Install and verify**
-
-Run: `npm install && npm run typecheck`
-Expected: installs cleanly; `tsc --noEmit` exits 0 (no source files yet).
+- [ ] **Step 5: Install and verify** — Run: `npm install && npm run typecheck` — Expected: clean install; `tsc` exits 0.
 
 - [ ] **Step 6: Commit**
 
@@ -149,56 +144,55 @@ git commit -m "chore: scaffold TypeScript + Vitest project"
 
 ## Task 2: Shared types and version constants
 
-**Files:**
-- Create: `src/types.ts`
-- Test: `tests/types.test.ts`
+**Files:** Create `src/types.ts`; Test `tests/types.test.ts`
 
 **Interfaces:**
-- Produces: `RawBar`, `MetricRow`, `RunManifest`, `QualityStatus`, `RunMode`, and constants `SCHEMA_VERSION`, `METRIC_VERSION`, `SOURCE_VERSION`. Every later task imports from here.
+- Produces `VendorBar` (provider output), `RawBarRow` (stored raw = VendorBar + provenance), `Provenance`, `MetricRow`, `RunManifest`, `QualityStatus`, `RunMode`, and constants. Every later task imports from here.
 
 - [ ] **Step 1: Write the failing test**
 
 ```ts
 // tests/types.test.ts
 import { describe, it, expect } from "vitest";
-import { SCHEMA_VERSION, METRIC_VERSION, SOURCE_VERSION } from "../src/types.js";
+import { SCHEMA_VERSION, RAW_SCHEMA_VERSION, METRIC_VERSION, SOURCE_VERSION } from "../src/types.js";
 
 describe("version constants", () => {
-  it("uses the metrics_v1 schema id", () => {
+  it("exposes the schema ids and versions", () => {
     expect(SCHEMA_VERSION).toBe("metrics_v1");
+    expect(RAW_SCHEMA_VERSION).toBe("dailyBars_v1");
     expect(METRIC_VERSION).toBe("1.0");
     expect(SOURCE_VERSION).toBe("1.0");
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/types.test.ts`
-Expected: FAIL — cannot find module `../src/types.js`.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/types.test.ts` — Expected: FAIL (module not found).
 
 - [ ] **Step 3: Create `src/types.ts`**
 
 ```ts
 export const SCHEMA_VERSION = "metrics_v1";
+export const RAW_SCHEMA_VERSION = "dailyBars_v1";
 export const METRIC_VERSION = "1.0";
 export const SOURCE_VERSION = "1.0";
 
 export type RunMode = "daily" | "backfill";
 export type QualityStatus = "OK" | "WARN" | "REJECTED";
 
-export interface RawBar {
+/** What a MarketDataProvider returns: vendor data only, no pipeline provenance. */
+export interface VendorBar {
   ticker: string;
   date: string; // YYYY-MM-DD
   open: number;
   high: number;
   low: number;
   close: number;
-  adjustedClose: number;
+  adjustedClose: number | null; // null when the vendor feed is unadjusted
+  isAdjusted: boolean;
   volume: number;
   source: string;
   sourceVersion: string;
-  ingestedAt: string; // ISO 8601
+  ingestedAt: string; // ISO 8601, set by the provider at fetch time
 }
 
 export interface Provenance {
@@ -207,6 +201,14 @@ export interface Provenance {
   source: string;
   sourceVersion: string;
   schemaVersion: string;
+  metricVersion: string;
+  universeVersion: string;
+}
+
+/** Stored raw row = vendor bar enriched with full provenance by the pipeline. */
+export interface RawBarRow extends VendorBar {
+  runId: string;
+  schemaVersion: string; // RAW_SCHEMA_VERSION
   metricVersion: string;
   universeVersion: string;
 }
@@ -252,35 +254,30 @@ export interface RunManifest {
   rowsWritten: number;
   warnings: number;
   rejected: number;
+  missingBars: number;
   runtimeSec: number;
   metricVersion: string;
   schemaVersion: string;
-  status: "SUCCESS" | "PARTIAL" | "FAILURE";
+  status: "SUCCESS" | "PARTIAL" | "FAILURE" | "SKIPPED";
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `npx vitest run tests/types.test.ts`
-Expected: PASS.
+- [ ] **Step 4: Run test to verify it passes** — Run: `npx vitest run tests/types.test.ts` — Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/types.ts tests/types.test.ts
-git commit -m "feat: add shared types and version constants"
+git commit -m "feat: add shared types (VendorBar/RawBarRow/MetricRow) and constants"
 ```
 
 ---
 
 ## Task 3: Metric registry + schema registry
 
-**Files:**
-- Create: `config/metrics.ts`, `schemas/dailyBars_v1.json`, `schemas/metrics_v1.json`
-- Test: `tests/metrics-registry.test.ts`
+**Files:** Create `config/metrics.ts`, `schemas/dailyBars_v1.json`, `schemas/metrics_v1.json`; Test `tests/metrics-registry.test.ts`
 
-**Interfaces:**
-- Produces: `METRIC_REGISTRY: MetricDef[]` where `MetricDef = { name: string; description: string; dependsOn: string[]; window: number | null; version: string }`. Consumed by `metrics.ts` (Task 8) and the data dictionary (Task 18).
+**Interfaces:** Produces `METRIC_REGISTRY: MetricDef[]` (`{ name, description, dependsOn, window, version }`). Consumed by `metrics.ts` and the data dictionary.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -290,13 +287,12 @@ import { describe, it, expect } from "vitest";
 import { METRIC_REGISTRY } from "../config/metrics.js";
 
 describe("metric registry", () => {
-  it("declares ma200 with its window and dependency", () => {
+  it("declares ma200 with window and dependency", () => {
     const ma200 = METRIC_REGISTRY.find((m) => m.name === "ma200");
     expect(ma200).toBeDefined();
     expect(ma200!.window).toBe(200);
     expect(ma200!.dependsOn).toContain("close");
   });
-
   it("has unique metric names", () => {
     const names = METRIC_REGISTRY.map((m) => m.name);
     expect(new Set(names).size).toBe(names.length);
@@ -304,10 +300,7 @@ describe("metric registry", () => {
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/metrics-registry.test.ts`
-Expected: FAIL — cannot find module `../config/metrics.js`.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/metrics-registry.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `config/metrics.ts`**
 
@@ -322,13 +315,13 @@ export interface MetricDef {
 
 export const METRIC_REGISTRY: MetricDef[] = [
   { name: "dollarVolume", description: "close * volume", dependsOn: ["close", "volume"], window: null, version: "1.0" },
-  { name: "ma20", description: "20-day simple moving average of close", dependsOn: ["close"], window: 20, version: "1.0" },
-  { name: "ma50", description: "50-day simple moving average of close", dependsOn: ["close"], window: 50, version: "1.0" },
-  { name: "ma150", description: "150-day simple moving average of close", dependsOn: ["close"], window: 150, version: "1.0" },
-  { name: "ma200", description: "200-day simple moving average of close", dependsOn: ["close"], window: 200, version: "1.0" },
+  { name: "ma20", description: "20-day SMA of close", dependsOn: ["close"], window: 20, version: "1.0" },
+  { name: "ma50", description: "50-day SMA of close", dependsOn: ["close"], window: 50, version: "1.0" },
+  { name: "ma150", description: "150-day SMA of close", dependsOn: ["close"], window: 150, version: "1.0" },
+  { name: "ma200", description: "200-day SMA of close", dependsOn: ["close"], window: 200, version: "1.0" },
   { name: "avgVolume20", description: "20-day average volume", dependsOn: ["volume"], window: 20, version: "1.0" },
   { name: "avgVolume50", description: "50-day average volume", dependsOn: ["volume"], window: 50, version: "1.0" },
-  { name: "atr14", description: "14-day average true range (SMA of true range)", dependsOn: ["high", "low", "close"], window: 14, version: "1.0" },
+  { name: "atr14", description: "14-day ATR = SMA of last 14 true ranges (requires >= 15 bars)", dependsOn: ["high", "low", "close"], window: 14, version: "1.0" },
   { name: "high52w", description: "highest high over trailing 252 sessions", dependsOn: ["high"], window: 252, version: "1.0" },
   { name: "low52w", description: "lowest low over trailing 252 sessions", dependsOn: ["low"], window: 252, version: "1.0" },
   { name: "distanceTo52wHighPct", description: "percent distance of close to 52w high (<=0)", dependsOn: ["close", "high"], window: 252, version: "1.0" },
@@ -342,7 +335,7 @@ export const METRIC_REGISTRY: MetricDef[] = [
   { name: "above150ma", description: "close > ma150", dependsOn: ["close"], window: 150, version: "1.0" },
   { name: "above200ma", description: "close > ma200", dependsOn: ["close"], window: 200, version: "1.0" },
   { name: "ma150Above200", description: "ma150 > ma200", dependsOn: ["close"], window: 200, version: "1.0" },
-  { name: "ma200Rising", description: "today ma200 > prior session ma200", dependsOn: ["close"], window: 201, version: "1.0" },
+  { name: "ma200Rising", description: "today ma200 > prior session ma200 (requires 201 bars)", dependsOn: ["close"], window: 201, version: "1.0" },
 ];
 ```
 
@@ -353,7 +346,7 @@ export const METRIC_REGISTRY: MetricDef[] = [
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "dailyBars_v1",
   "type": "object",
-  "required": ["ticker", "date", "open", "high", "low", "close", "adjustedClose", "volume", "source", "sourceVersion", "ingestedAt"],
+  "required": ["ticker", "date", "open", "high", "low", "close", "isAdjusted", "volume", "source", "sourceVersion", "ingestedAt", "runId", "schemaVersion", "metricVersion", "universeVersion"],
   "properties": {
     "ticker": { "type": "string" },
     "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
@@ -361,11 +354,16 @@ export const METRIC_REGISTRY: MetricDef[] = [
     "high": { "type": "number" },
     "low": { "type": "number" },
     "close": { "type": "number" },
-    "adjustedClose": { "type": "number" },
+    "adjustedClose": { "type": ["number", "null"] },
+    "isAdjusted": { "type": "boolean" },
     "volume": { "type": "number" },
     "source": { "type": "string" },
     "sourceVersion": { "type": "string" },
-    "ingestedAt": { "type": "string" }
+    "ingestedAt": { "type": "string" },
+    "runId": { "type": "string" },
+    "schemaVersion": { "type": "string" },
+    "metricVersion": { "type": "string" },
+    "universeVersion": { "type": "string" }
   }
 }
 ```
@@ -383,6 +381,7 @@ export const METRIC_REGISTRY: MetricDef[] = [
     "date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
     "close": { "type": "number" },
     "qualityStatus": { "type": "string", "enum": ["OK", "WARN", "REJECTED"] },
+    "qualityIssues": { "type": "string", "description": "JSON-encoded string array" },
     "runId": { "type": "string" },
     "schemaVersion": { "type": "string" },
     "metricVersion": { "type": "string" },
@@ -391,29 +390,106 @@ export const METRIC_REGISTRY: MetricDef[] = [
 }
 ```
 
-- [ ] **Step 6: Run test to verify it passes**
-
-Run: `npx vitest run tests/metrics-registry.test.ts`
-Expected: PASS.
+- [ ] **Step 6: Run test to verify it passes** — Run: `npx vitest run tests/metrics-registry.test.ts` — Expected: PASS.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add config/metrics.ts schemas/dailyBars_v1.json schemas/metrics_v1.json tests/metrics-registry.test.ts
+git add config/metrics.ts schemas/ tests/metrics-registry.test.ts
 git commit -m "feat: add metric registry and schema registry"
 ```
 
 ---
 
-## Task 4: Universe loader (versioned)
+## Task 4: Market calendar
 
-**Files:**
-- Create: `src/universe.ts`, `config/universe/sp500.json`, `config/universe/nasdaq100.json`, `config/universe/watchlist.json`
-- Test: `tests/universe.test.ts`
+**Files:** Create `config/calendar/holidays.json`, `src/calendar.ts`; Test `tests/calendar.test.ts`
 
 **Interfaces:**
-- Consumes: nothing.
-- Produces: `loadUniverse(): { tickers: string[]; universeVersion: string }`. The `tickers` are upper-cased, merged, and deduped across all three files. `universeVersion` is read from the `version` field shared by the files.
+- Produces `isWeekend(date): boolean`, `isTradingDay(date: string, holidays?: Set<string>): boolean`, `previousTradingDay(date: string, holidays?: Set<string>): string`. Holidays are a committed static list (a real exchange calendar is Part 2).
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// tests/calendar.test.ts
+import { describe, it, expect } from "vitest";
+import { isWeekend, isTradingDay, previousTradingDay } from "../src/calendar.js";
+
+const holidays = new Set(["2026-07-03"]); // observed Independence Day
+
+describe("calendar", () => {
+  it("detects weekends", () => {
+    expect(isWeekend("2026-06-27")).toBe(true);  // Saturday
+    expect(isWeekend("2026-06-29")).toBe(false); // Monday
+  });
+  it("treats holidays and weekends as non-trading", () => {
+    expect(isTradingDay("2026-07-03", holidays)).toBe(false);
+    expect(isTradingDay("2026-06-27", holidays)).toBe(false);
+    expect(isTradingDay("2026-06-29", holidays)).toBe(true);
+  });
+  it("walks back over a weekend to the prior trading day", () => {
+    expect(previousTradingDay("2026-06-29", holidays)).toBe("2026-06-26"); // Mon -> Fri
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/calendar.test.ts` — Expected: FAIL.
+
+- [ ] **Step 3: Create `config/calendar/holidays.json`**
+
+```json
+{
+  "version": "2026",
+  "dates": [
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+    "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
+    "2026-11-26", "2026-12-25"
+  ]
+}
+```
+
+- [ ] **Step 4: Create `src/calendar.ts`**
+
+```ts
+import holidays from "../config/calendar/holidays.json" with { type: "json" };
+
+const DEFAULT_HOLIDAYS = new Set<string>(holidays.dates);
+
+export function isWeekend(date: string): boolean {
+  // Parse as UTC noon to avoid timezone rollover.
+  const day = new Date(`${date}T12:00:00Z`).getUTCDay();
+  return day === 0 || day === 6;
+}
+
+export function isTradingDay(date: string, holidaySet: Set<string> = DEFAULT_HOLIDAYS): boolean {
+  return !isWeekend(date) && !holidaySet.has(date);
+}
+
+export function previousTradingDay(date: string, holidaySet: Set<string> = DEFAULT_HOLIDAYS): string {
+  const d = new Date(`${date}T12:00:00Z`);
+  do {
+    d.setUTCDate(d.getUTCDate() - 1);
+  } while (!isTradingDay(d.toISOString().slice(0, 10), holidaySet));
+  return d.toISOString().slice(0, 10);
+}
+```
+
+- [ ] **Step 5: Run tests to verify they pass** — Run: `npx vitest run tests/calendar.test.ts` — Expected: PASS (all three).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add src/calendar.ts config/calendar/ tests/calendar.test.ts
+git commit -m "feat: add market calendar (trading-day awareness)"
+```
+
+---
+
+## Task 5: Universe loader (versioned)
+
+**Files:** Create `src/universe.ts`, `config/universe/sp500.json`, `config/universe/nasdaq100.json`, `config/universe/watchlist.json`; Test `tests/universe.test.ts`
+
+**Interfaces:** Produces `mergeUniverse(files): { tickers: string[]; universeVersion: string }` and `loadUniverse()`. Tickers upper-cased, merged, deduped; version shared across files.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -423,30 +499,24 @@ import { describe, it, expect } from "vitest";
 import { mergeUniverse } from "../src/universe.js";
 
 describe("mergeUniverse", () => {
-  it("merges, upper-cases, and dedupes tickers", () => {
-    const result = mergeUniverse([
+  it("merges, upper-cases, and dedupes", () => {
+    const r = mergeUniverse([
       { version: "2026-06-29", tickers: ["aapl", "MSFT"] },
       { version: "2026-06-29", tickers: ["msft", "GOOG"] },
     ]);
-    expect(result.tickers).toEqual(["AAPL", "MSFT", "GOOG"]);
-    expect(result.universeVersion).toBe("2026-06-29");
+    expect(r.tickers).toEqual(["AAPL", "MSFT", "GOOG"]);
+    expect(r.universeVersion).toBe("2026-06-29");
   });
-
-  it("throws if files disagree on version", () => {
-    expect(() =>
-      mergeUniverse([
-        { version: "2026-06-29", tickers: ["AAPL"] },
-        { version: "2026-06-30", tickers: ["MSFT"] },
-      ]),
-    ).toThrow(/version mismatch/i);
+  it("throws on version mismatch", () => {
+    expect(() => mergeUniverse([
+      { version: "2026-06-29", tickers: ["AAPL"] },
+      { version: "2026-06-30", tickers: ["MSFT"] },
+    ])).toThrow(/version mismatch/i);
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/universe.test.ts`
-Expected: FAIL — cannot find module `../src/universe.js`.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/universe.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create the universe JSON files**
 
@@ -454,18 +524,16 @@ Expected: FAIL — cannot find module `../src/universe.js`.
 ```json
 { "version": "2026-06-29", "tickers": ["AAPL", "MSFT", "GOOG", "AMZN", "NVDA"] }
 ```
-
 `config/universe/nasdaq100.json`:
 ```json
 { "version": "2026-06-29", "tickers": ["AAPL", "MSFT", "NVDA", "TSLA", "AVGO"] }
 ```
-
 `config/universe/watchlist.json`:
 ```json
 { "version": "2026-06-29", "tickers": ["SPY", "QQQ"] }
 ```
 
-> Note: these are seed lists. Expanding to full S&P 500 / Nasdaq 100 is a later data-entry PR; the loader does not change.
+> Seed lists. Expanding to full constituents is a later data-entry PR; the loader is unchanged.
 
 - [ ] **Step 4: Create `src/universe.ts`**
 
@@ -474,30 +542,18 @@ import sp500 from "../config/universe/sp500.json" with { type: "json" };
 import nasdaq100 from "../config/universe/nasdaq100.json" with { type: "json" };
 import watchlist from "../config/universe/watchlist.json" with { type: "json" };
 
-export interface UniverseFile {
-  version: string;
-  tickers: string[];
-}
-
-export interface ResolvedUniverse {
-  tickers: string[];
-  universeVersion: string;
-}
+export interface UniverseFile { version: string; tickers: string[]; }
+export interface ResolvedUniverse { tickers: string[]; universeVersion: string; }
 
 export function mergeUniverse(files: UniverseFile[]): ResolvedUniverse {
   const versions = new Set(files.map((f) => f.version));
-  if (versions.size > 1) {
-    throw new Error(`Universe version mismatch: ${[...versions].join(", ")}`);
-  }
+  if (versions.size > 1) throw new Error(`Universe version mismatch: ${[...versions].join(", ")}`);
   const seen = new Set<string>();
   const tickers: string[] = [];
   for (const file of files) {
     for (const raw of file.tickers) {
       const t = raw.toUpperCase();
-      if (!seen.has(t)) {
-        seen.add(t);
-        tickers.push(t);
-      }
+      if (!seen.has(t)) { seen.add(t); tickers.push(t); }
     }
   }
   return { tickers, universeVersion: files[0]!.version };
@@ -508,10 +564,7 @@ export function loadUniverse(): ResolvedUniverse {
 }
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
-
-Run: `npx vitest run tests/universe.test.ts`
-Expected: PASS (both cases).
+- [ ] **Step 5: Run tests to verify they pass** — Run: `npx vitest run tests/universe.test.ts` — Expected: PASS.
 
 - [ ] **Step 6: Commit**
 
@@ -522,17 +575,14 @@ git commit -m "feat: add versioned universe loader"
 
 ---
 
-## Task 5: Provider interface, factory, and fake provider
+## Task 6: Provider interface, factory, and fake provider
 
-**Files:**
-- Create: `src/providers/provider.ts`, `src/providers/factory.ts`, `src/providers/fake.ts`
-- Test: `tests/provider-factory.test.ts`
+**Files:** Create `src/providers/provider.ts`, `src/providers/factory.ts`, `src/providers/fake.ts`; Test `tests/provider-factory.test.ts`
 
 **Interfaces:**
-- Produces:
-  - `interface MarketDataProvider { readonly name: string; readonly version: string; getLatestBars(date: string, tickers: string[]): Promise<RawBar[]>; getHistory(ticker: string, lookbackDays: number): Promise<RawBar[]> }`
-  - `getProvider(name: string, secrets: Record<string,string>): MarketDataProvider`
-  - `class FakeProvider implements MarketDataProvider` (constructed with a `Map<string, RawBar[]>` of history per ticker).
+- `interface MarketDataProvider { readonly name: string; readonly version: string; getLatestBars(date, tickers): Promise<VendorBar[]>; getHistory(ticker, lookbackDays): Promise<VendorBar[]> }`. `getLatestBars` returns ONLY bars whose date equals the requested `date` (no stale fallback).
+- `getProvider(name, secrets): MarketDataProvider`.
+- `class FakeProvider` constructed with `Map<string, VendorBar[]>`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -541,44 +591,42 @@ git commit -m "feat: add versioned universe loader"
 import { describe, it, expect } from "vitest";
 import { getProvider } from "../src/providers/factory.js";
 import { FakeProvider } from "../src/providers/fake.js";
+import type { VendorBar } from "../src/types.js";
+
+const bar = (date: string): VendorBar => ({ ticker: "AAPL", date, open: 1, high: 2, low: 1, close: 2, adjustedClose: null, isAdjusted: false, volume: 10, source: "fake", sourceVersion: "1.0", ingestedAt: "x" });
 
 describe("getProvider", () => {
-  it("returns a fake provider by name", () => {
-    const p = getProvider("fake", {});
-    expect(p.name).toBe("fake");
-  });
-
-  it("throws on unknown provider", () => {
-    expect(() => getProvider("nope", {})).toThrow(/unknown data provider/i);
-  });
+  it("returns a fake provider", () => { expect(getProvider("fake", {}).name).toBe("fake"); });
+  it("throws on unknown provider", () => { expect(() => getProvider("nope", {})).toThrow(/unknown data provider/i); });
 });
 
-describe("FakeProvider", () => {
-  it("returns the latest bar per ticker", async () => {
-    const bar = { ticker: "AAPL", date: "2026-06-29", open: 1, high: 2, low: 1, close: 2, adjustedClose: 2, volume: 10, source: "fake", sourceVersion: "1.0", ingestedAt: "2026-06-29T22:30:00Z" };
-    const p = new FakeProvider(new Map([["AAPL", [bar]]]));
+describe("FakeProvider.getLatestBars", () => {
+  it("returns only the bar matching the requested date", async () => {
+    const p = new FakeProvider(new Map([["AAPL", [bar("2026-06-26"), bar("2026-06-29")]]]));
     const out = await p.getLatestBars("2026-06-29", ["AAPL"]);
     expect(out).toHaveLength(1);
-    expect(out[0]!.close).toBe(2);
+    expect(out[0]!.date).toBe("2026-06-29");
+  });
+  it("returns nothing when the date is missing (no stale fallback)", async () => {
+    const p = new FakeProvider(new Map([["AAPL", [bar("2026-06-26")]]]));
+    expect(await p.getLatestBars("2026-06-29", ["AAPL"])).toEqual([]);
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/provider-factory.test.ts`
-Expected: FAIL — modules not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/provider-factory.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/providers/provider.ts`**
 
 ```ts
-import type { RawBar } from "../types.js";
+import type { VendorBar } from "../types.js";
 
 export interface MarketDataProvider {
   readonly name: string;
   readonly version: string;
-  getLatestBars(date: string, tickers: string[]): Promise<RawBar[]>;
-  getHistory(ticker: string, lookbackDays: number): Promise<RawBar[]>;
+  /** Returns ONLY bars whose date === the requested date. Empty if absent — never a stale bar. */
+  getLatestBars(date: string, tickers: string[]): Promise<VendorBar[]>;
+  getHistory(ticker: string, lookbackDays: number): Promise<VendorBar[]>;
 }
 ```
 
@@ -586,26 +634,24 @@ export interface MarketDataProvider {
 
 ```ts
 import type { MarketDataProvider } from "./provider.js";
-import type { RawBar } from "../types.js";
+import type { VendorBar } from "../types.js";
 
 export class FakeProvider implements MarketDataProvider {
   readonly name = "fake";
   readonly version = "1.0";
-  constructor(private readonly history: Map<string, RawBar[]>) {}
+  constructor(private readonly history: Map<string, VendorBar[]>) {}
 
-  async getLatestBars(date: string, tickers: string[]): Promise<RawBar[]> {
-    const out: RawBar[] = [];
+  async getLatestBars(date: string, tickers: string[]): Promise<VendorBar[]> {
+    const out: VendorBar[] = [];
     for (const t of tickers) {
-      const bars = this.history.get(t) ?? [];
-      const last = bars[bars.length - 1];
-      if (last) out.push(last);
+      const match = (this.history.get(t) ?? []).find((b) => b.date === date);
+      if (match) out.push(match);
     }
     return out;
   }
 
-  async getHistory(ticker: string, lookbackDays: number): Promise<RawBar[]> {
-    const bars = this.history.get(ticker) ?? [];
-    return bars.slice(-lookbackDays);
+  async getHistory(ticker: string, lookbackDays: number): Promise<VendorBar[]> {
+    return (this.history.get(ticker) ?? []).slice(-lookbackDays);
   }
 }
 ```
@@ -619,34 +665,28 @@ import { FinnhubProvider } from "./finnhub.js";
 
 export function getProvider(name: string, secrets: Record<string, string>): MarketDataProvider {
   switch (name) {
-    case "finnhub":
-      return new FinnhubProvider(secrets.finnhubToken ?? "");
-    case "fake":
-      return new FakeProvider(new Map());
-    default:
-      throw new Error(`Unknown data provider: ${name}`);
+    case "finnhub": return new FinnhubProvider(secrets.finnhubToken ?? "");
+    case "fake": return new FakeProvider(new Map());
+    default: throw new Error(`Unknown data provider: ${name}`);
   }
 }
 ```
 
-> Note: `finnhub.ts` is created in Task 6. To keep this task self-contained and green, create a temporary stub now and replace it in Task 6:
+> `finnhub.ts` arrives in Task 7. Create this temporary stub now so the factory compiles, then replace it:
 > `src/providers/finnhub.ts`:
 > ```ts
 > import type { MarketDataProvider } from "./provider.js";
-> import type { RawBar } from "../types.js";
+> import type { VendorBar } from "../types.js";
 > export class FinnhubProvider implements MarketDataProvider {
 >   readonly name = "finnhub";
 >   readonly version = "1.0";
 >   constructor(_token: string) {}
->   async getLatestBars(_d: string, _t: string[]): Promise<RawBar[]> { throw new Error("not implemented"); }
->   async getHistory(_t: string, _n: number): Promise<RawBar[]> { throw new Error("not implemented"); }
+>   async getLatestBars(_d: string, _t: string[]): Promise<VendorBar[]> { throw new Error("not implemented"); }
+>   async getHistory(_t: string, _n: number): Promise<VendorBar[]> { throw new Error("not implemented"); }
 > }
 > ```
 
-- [ ] **Step 6: Run tests to verify they pass**
-
-Run: `npx vitest run tests/provider-factory.test.ts`
-Expected: PASS.
+- [ ] **Step 6: Run tests to verify they pass** — Run: `npx vitest run tests/provider-factory.test.ts` — Expected: PASS.
 
 - [ ] **Step 7: Commit**
 
@@ -657,15 +697,13 @@ git commit -m "feat: add provider interface, factory, and fake provider"
 
 ---
 
-## Task 6: Finnhub provider with rate limiting
+## Task 7: Finnhub provider (unadjusted, no stale fallback, rate-limited)
 
-**Files:**
-- Modify: `src/providers/finnhub.ts` (replace the Task 5 stub)
-- Test: `tests/finnhub.test.ts`
+**Files:** Modify `src/providers/finnhub.ts` (replace stub); Test `tests/finnhub.test.ts`
 
 **Interfaces:**
-- Consumes: `MarketDataProvider`, `RawBar`.
-- Produces: `class FinnhubProvider` with an injectable `fetchFn` (defaults to global `fetch`) and a rate limiter capping requests to ≤ `maxPerMinute` (default 55, just under Finnhub's 60). `mapCandle(symbol, json)` converts Finnhub's candle response to `RawBar[]`.
+- `mapCandle(symbol, json, ingestedAt): VendorBar[]` — sets `adjustedClose=null, isAdjusted=false` (Finnhub free candles are unadjusted).
+- `class FinnhubProvider` with injectable `fetchFn` + rate limiter (≤ `maxPerMinute`, default 55). `getLatestBars` returns only the exact-date bar (no fallback).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -675,71 +713,52 @@ import { describe, it, expect } from "vitest";
 import { mapCandle } from "../src/providers/finnhub.js";
 
 describe("mapCandle", () => {
-  it("maps a finnhub candle payload to RawBars", () => {
+  it("maps a finnhub candle to VendorBars marked unadjusted", () => {
     const json = { s: "ok", t: [1750000000], o: [10], h: [12], l: [9], c: [11], v: [1000] };
     const bars = mapCandle("AAPL", json, "2026-06-29T22:30:00Z");
     expect(bars).toHaveLength(1);
     expect(bars[0]).toMatchObject({
       ticker: "AAPL", close: 11, high: 12, low: 9, open: 10, volume: 1000,
-      adjustedClose: 11, source: "finnhub", sourceVersion: "1.0",
+      adjustedClose: null, isAdjusted: false, source: "finnhub", sourceVersion: "1.0",
     });
     expect(bars[0]!.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
   });
-
-  it("returns empty array when status is not ok", () => {
-    expect(mapCandle("AAPL", { s: "no_data" }, "2026-06-29T22:30:00Z")).toEqual([]);
+  it("returns [] when status is not ok", () => {
+    expect(mapCandle("AAPL", { s: "no_data" }, "x")).toEqual([]);
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/finnhub.test.ts`
-Expected: FAIL — `mapCandle` is not exported.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/finnhub.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Replace `src/providers/finnhub.ts`**
 
 ```ts
 import type { MarketDataProvider } from "./provider.js";
-import type { RawBar } from "../types.js";
+import type { VendorBar } from "../types.js";
 import { SOURCE_VERSION } from "../types.js";
 
-interface FinnhubCandle {
-  s: string;
-  t?: number[];
-  o?: number[];
-  h?: number[];
-  l?: number[];
-  c?: number[];
-  v?: number[];
-}
-
+interface FinnhubCandle { s: string; t?: number[]; o?: number[]; h?: number[]; l?: number[]; c?: number[]; v?: number[]; }
 type FetchFn = (url: string) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
 
-export function mapCandle(symbol: string, raw: unknown, ingestedAt: string): RawBar[] {
+export function mapCandle(symbol: string, raw: unknown, ingestedAt: string): VendorBar[] {
   const json = raw as FinnhubCandle;
   if (!json || json.s !== "ok" || !json.t) return [];
-  const bars: RawBar[] = [];
+  const bars: VendorBar[] = [];
   for (let i = 0; i < json.t.length; i++) {
-    const close = json.c![i]!;
     bars.push({
       ticker: symbol,
       date: new Date(json.t[i]! * 1000).toISOString().slice(0, 10),
-      open: json.o![i]!,
-      high: json.h![i]!,
-      low: json.l![i]!,
-      close,
-      adjustedClose: close, // free tier: no separate adjusted series; recorded as-is
+      open: json.o![i]!, high: json.h![i]!, low: json.l![i]!, close: json.c![i]!,
+      adjustedClose: null,   // Finnhub free candles are unadjusted; never fabricate this
+      isAdjusted: false,
       volume: json.v![i]!,
-      source: "finnhub",
-      sourceVersion: SOURCE_VERSION,
-      ingestedAt,
+      source: "finnhub", sourceVersion: SOURCE_VERSION, ingestedAt,
     });
   }
   return bars;
 }
 
-/** Resolves after enough delay to keep calls under `maxPerMinute`. */
 class RateLimiter {
   private last = 0;
   constructor(private readonly minIntervalMs: number) {}
@@ -749,7 +768,6 @@ class RateLimiter {
     this.last = now();
   }
 }
-
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class FinnhubProvider implements MarketDataProvider {
@@ -761,11 +779,9 @@ export class FinnhubProvider implements MarketDataProvider {
     private readonly token: string,
     private readonly fetchFn: FetchFn = fetch as unknown as FetchFn,
     maxPerMinute = 55,
-  ) {
-    this.limiter = new RateLimiter(Math.ceil(60000 / maxPerMinute));
-  }
+  ) { this.limiter = new RateLimiter(Math.ceil(60000 / maxPerMinute)); }
 
-  private async candle(symbol: string, fromSec: number, toSec: number): Promise<RawBar[]> {
+  private async candle(symbol: string, fromSec: number, toSec: number): Promise<VendorBar[]> {
     await this.limiter.wait(sleep, () => Date.now());
     const url = `https://finnhub.io/api/v1/stock/candle?symbol=${symbol}&resolution=D&from=${fromSec}&to=${toSec}&token=${this.token}`;
     const res = await this.fetchFn(url);
@@ -773,49 +789,42 @@ export class FinnhubProvider implements MarketDataProvider {
     return mapCandle(symbol, await res.json(), new Date().toISOString());
   }
 
-  async getLatestBars(date: string, tickers: string[]): Promise<RawBar[]> {
+  async getLatestBars(date: string, tickers: string[]): Promise<VendorBar[]> {
     const to = Math.floor(new Date(`${date}T23:59:59Z`).getTime() / 1000);
-    const from = to - 5 * 86400; // small window; keep only the row matching `date`
-    const out: RawBar[] = [];
+    const from = to - 5 * 86400;
+    const out: VendorBar[] = [];
     for (const t of tickers) {
       const bars = await this.candle(t, from, to);
-      const match = bars.find((b) => b.date === date) ?? bars[bars.length - 1];
+      const match = bars.find((b) => b.date === date); // exact date only — no stale fallback
       if (match) out.push(match);
     }
     return out;
   }
 
-  async getHistory(ticker: string, lookbackDays: number): Promise<RawBar[]> {
+  async getHistory(ticker: string, lookbackDays: number): Promise<VendorBar[]> {
     const to = Math.floor(Date.now() / 1000);
-    const from = to - Math.ceil(lookbackDays * 1.5) * 86400; // calendar pad for weekends/holidays
+    const from = to - Math.ceil(lookbackDays * 1.5) * 86400; // pad for weekends/holidays
     return this.candle(ticker, from, to);
   }
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `npx vitest run tests/finnhub.test.ts tests/provider-factory.test.ts`
-Expected: PASS (mapCandle tests + factory still green).
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/finnhub.test.ts tests/provider-factory.test.ts` — Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/providers/finnhub.ts tests/finnhub.test.ts
-git commit -m "feat: implement Finnhub provider with rate limiting"
+git commit -m "feat: implement Finnhub provider (unadjusted, exact-date, rate-limited)"
 ```
 
 ---
 
-## Task 7: Quality validation
+## Task 8: Quality validation
 
-**Files:**
-- Create: `src/validate.ts`
-- Test: `tests/validate.test.ts`
+**Files:** Create `src/validate.ts`; Test `tests/validate.test.ts`
 
-**Interfaces:**
-- Consumes: `RawBar`, `QualityStatus`.
-- Produces: `gradeBar(bar: RawBar, seenKeys: Set<string>): { status: QualityStatus; issues: string[] }`. `seenKeys` accumulates `"ticker|date"` to catch duplicates across a batch.
+**Interfaces:** `gradeBar(bar: VendorBar, seenKeys: Set<string>): { status: QualityStatus; issues: string[] }`. `seenKeys` accumulates `"ticker|date"` across the batch for duplicate detection. **Called once per bar at the pipeline batch stage**, not inside metric computation.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -823,56 +832,40 @@ git commit -m "feat: implement Finnhub provider with rate limiting"
 // tests/validate.test.ts
 import { describe, it, expect } from "vitest";
 import { gradeBar } from "../src/validate.js";
-import type { RawBar } from "../src/types.js";
+import type { VendorBar } from "../src/types.js";
 
-const base: RawBar = {
-  ticker: "AAPL", date: "2026-06-29", open: 10, high: 12, low: 9, close: 11,
-  adjustedClose: 11, volume: 1000, source: "fake", sourceVersion: "1.0", ingestedAt: "x",
-};
+const base: VendorBar = { ticker: "AAPL", date: "2026-06-29", open: 10, high: 12, low: 9, close: 11, adjustedClose: null, isAdjusted: false, volume: 1000, source: "fake", sourceVersion: "1.0", ingestedAt: "x" };
 
 describe("gradeBar", () => {
-  it("grades a clean bar OK", () => {
-    expect(gradeBar(base, new Set()).status).toBe("OK");
-  });
-
+  it("grades a clean bar OK", () => { expect(gradeBar(base, new Set()).status).toBe("OK"); });
   it("rejects a negative price", () => {
     const r = gradeBar({ ...base, close: -1 }, new Set());
-    expect(r.status).toBe("REJECTED");
-    expect(r.issues).toContain("negative_price");
+    expect(r.status).toBe("REJECTED"); expect(r.issues).toContain("negative_price");
   });
-
   it("rejects a duplicate ticker/date", () => {
-    const seen = new Set<string>();
-    gradeBar(base, seen);
+    const seen = new Set<string>(); gradeBar(base, seen);
     const r = gradeBar(base, seen);
-    expect(r.status).toBe("REJECTED");
-    expect(r.issues).toContain("duplicate");
+    expect(r.status).toBe("REJECTED"); expect(r.issues).toContain("duplicate");
   });
-
   it("warns on zero volume", () => {
     const r = gradeBar({ ...base, volume: 0 }, new Set());
-    expect(r.status).toBe("WARN");
-    expect(r.issues).toContain("zero_volume");
+    expect(r.status).toBe("WARN"); expect(r.issues).toContain("zero_volume");
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/validate.test.ts`
-Expected: FAIL — module not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/validate.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/validate.ts`**
 
 ```ts
-import type { RawBar, QualityStatus } from "./types.js";
+import type { VendorBar, QualityStatus } from "./types.js";
 
-export function gradeBar(bar: RawBar, seenKeys: Set<string>): { status: QualityStatus; issues: string[] } {
+export function gradeBar(bar: VendorBar, seenKeys: Set<string>): { status: QualityStatus; issues: string[] } {
   const issues: string[] = [];
   let status: QualityStatus = "OK";
-
-  const reject = (code: string) => { issues.push(code); status = "REJECTED"; };
-  const warn = (code: string) => { issues.push(code); if (status === "OK") status = "WARN"; };
+  const reject = (c: string) => { issues.push(c); status = "REJECTED"; };
+  const warn = (c: string) => { issues.push(c); if (status === "OK") status = "WARN"; };
 
   if (bar.close === null || bar.close === undefined || Number.isNaN(bar.close)) reject("missing_close");
   if (bar.volume === null || bar.volume === undefined || Number.isNaN(bar.volume)) reject("missing_volume");
@@ -884,15 +877,11 @@ export function gradeBar(bar: RawBar, seenKeys: Set<string>): { status: QualityS
   else seenKeys.add(key);
 
   if (status !== "REJECTED" && bar.volume === 0) warn("zero_volume");
-
   return { status, issues };
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `npx vitest run tests/validate.test.ts`
-Expected: PASS (all four cases).
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/validate.test.ts` — Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -903,15 +892,12 @@ git commit -m "feat: add OK/WARN/REJECTED quality grading"
 
 ---
 
-## Task 8: Metric computation
+## Task 9: Metric computation (quality injected)
 
-**Files:**
-- Create: `src/metrics.ts`
-- Test: `tests/metrics.test.ts`
+**Files:** Create `src/metrics.ts`; Test `tests/metrics.test.ts`
 
 **Interfaces:**
-- Consumes: `RawBar`, `MetricRow`, `Provenance`, `gradeBar`.
-- Produces: `computeMetrics(bars: RawBar[], prov: Provenance): MetricRow`. `bars` is the trailing history for ONE ticker sorted ascending by date; the last element is the current session. Helper exports `sma`, `trueRanges`, `pctReturn` for unit testing.
+- `computeMetrics(bars: VendorBar[], prov: Provenance, quality: { status: QualityStatus; issues: string[] }): MetricRow`. `bars` is ONE ticker's trailing history sorted ascending; last element is the current session. Quality is computed by the pipeline (Task 8) and **injected** — `computeMetrics` does not grade. Helper exports `sma`, `smaAt`, `trueRanges`, `pctReturn`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -919,169 +905,117 @@ git commit -m "feat: add OK/WARN/REJECTED quality grading"
 // tests/metrics.test.ts
 import { describe, it, expect } from "vitest";
 import { sma, pctReturn, computeMetrics } from "../src/metrics.js";
-import type { RawBar, Provenance } from "../src/types.js";
+import type { VendorBar, Provenance } from "../src/types.js";
 
-const prov: Provenance = {
-  runId: "R", ingestedAt: "x", source: "fake", sourceVersion: "1.0",
-  schemaVersion: "metrics_v1", metricVersion: "1.0", universeVersion: "2026-06-29",
-};
-
-function bar(date: string, close: number, volume = 1000): RawBar {
-  return { ticker: "AAPL", date, open: close, high: close + 1, low: close - 1, close, adjustedClose: close, volume, source: "fake", sourceVersion: "1.0", ingestedAt: "x" };
-}
+const prov: Provenance = { runId: "R", ingestedAt: "x", source: "fake", sourceVersion: "1.0", schemaVersion: "metrics_v1", metricVersion: "1.0", universeVersion: "2026-06-29" };
+const ok = { status: "OK" as const, issues: [] as string[] };
+const bar = (date: string, close: number, volume = 1000): VendorBar => ({ ticker: "AAPL", date, open: close, high: close + 1, low: close - 1, close, adjustedClose: null, isAdjusted: false, volume, source: "fake", sourceVersion: "1.0", ingestedAt: "x" });
 
 describe("sma", () => {
-  it("averages the last N values", () => {
-    expect(sma([1, 2, 3, 4], 2)).toBe(3.5);
-  });
-  it("returns null when not enough data", () => {
-    expect(sma([1, 2], 5)).toBeNull();
-  });
+  it("averages the last N", () => { expect(sma([1, 2, 3, 4], 2)).toBe(3.5); });
+  it("is null when short", () => { expect(sma([1, 2], 5)).toBeNull(); });
 });
-
 describe("pctReturn", () => {
-  it("computes trailing return", () => {
-    expect(pctReturn([100, 110], 1)).toBeCloseTo(0.1);
-  });
+  it("computes trailing return", () => { expect(pctReturn([100, 110], 1)).toBeCloseTo(0.1); });
 });
-
 describe("computeMetrics", () => {
-  it("computes ma20 and flags from 25 sessions", () => {
-    const bars: RawBar[] = [];
+  it("computes ma20 and flags, injects quality", () => {
+    const bars: VendorBar[] = [];
     for (let i = 0; i < 25; i++) bars.push(bar(`2026-05-${String(i + 1).padStart(2, "0")}`, 100 + i));
-    const row = computeMetrics(bars, prov);
+    const row = computeMetrics(bars, prov, ok);
     expect(row.ticker).toBe("AAPL");
     expect(row.close).toBe(124);
     expect(row.ma20).toBeCloseTo(sma(bars.map((b) => b.close), 20)!);
     expect(row.above20ma).toBe(true);
-    expect(row.ma200).toBeNull(); // not enough history
+    expect(row.ma200).toBeNull();
     expect(row.qualityStatus).toBe("OK");
+    expect(row.runId).toBe("R");
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/metrics.test.ts`
-Expected: FAIL — module not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/metrics.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/metrics.ts`**
 
 ```ts
-import type { RawBar, MetricRow, Provenance } from "./types.js";
-import { gradeBar } from "./validate.js";
+import type { VendorBar, MetricRow, Provenance, QualityStatus } from "./types.js";
 
 export function sma(values: number[], window: number): number | null {
   if (values.length < window) return null;
-  const slice = values.slice(-window);
-  return slice.reduce((a, b) => a + b, 0) / window;
+  return values.slice(-window).reduce((a, b) => a + b, 0) / window;
 }
-
 export function smaAt(values: number[], window: number, offsetFromEnd: number): number | null {
   const end = values.length - offsetFromEnd;
   if (end < window) return null;
-  const slice = values.slice(end - window, end);
-  return slice.reduce((a, b) => a + b, 0) / window;
+  return values.slice(end - window, end).reduce((a, b) => a + b, 0) / window;
 }
-
-export function trueRanges(bars: RawBar[]): number[] {
+export function trueRanges(bars: VendorBar[]): number[] {
   const tr: number[] = [];
   for (let i = 1; i < bars.length; i++) {
-    const cur = bars[i]!, prev = bars[i - 1]!;
-    tr.push(Math.max(cur.high - cur.low, Math.abs(cur.high - prev.close), Math.abs(cur.low - prev.close)));
+    const c = bars[i]!, p = bars[i - 1]!;
+    tr.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
   }
   return tr;
 }
-
 export function pctReturn(closes: number[], lookback: number): number | null {
   if (closes.length <= lookback) return null;
-  const now = closes[closes.length - 1]!;
-  const then = closes[closes.length - 1 - lookback]!;
-  if (then === 0) return null;
-  return now / then - 1;
+  const now = closes[closes.length - 1]!, then = closes[closes.length - 1 - lookback]!;
+  return then === 0 ? null : now / then - 1;
 }
+function maxOver(v: number[], w: number): number | null { return v.length < w ? null : Math.max(...v.slice(-w)); }
+function minOver(v: number[], w: number): number | null { return v.length < w ? null : Math.min(...v.slice(-w)); }
 
-function maxOver(values: number[], window: number): number | null {
-  if (values.length < window) return null;
-  return Math.max(...values.slice(-window));
-}
-function minOver(values: number[], window: number): number | null {
-  if (values.length < window) return null;
-  return Math.min(...values.slice(-window));
-}
-
-export function computeMetrics(bars: RawBar[], prov: Provenance): MetricRow {
+export function computeMetrics(bars: VendorBar[], prov: Provenance, quality: { status: QualityStatus; issues: string[] }): MetricRow {
   const last = bars[bars.length - 1]!;
   const closes = bars.map((b) => b.close);
   const highs = bars.map((b) => b.high);
   const lows = bars.map((b) => b.low);
   const volumes = bars.map((b) => b.volume);
 
-  const ma20 = sma(closes, 20);
-  const ma50 = sma(closes, 50);
-  const ma150 = sma(closes, 150);
-  const ma200 = sma(closes, 200);
+  const ma20 = sma(closes, 20), ma50 = sma(closes, 50), ma150 = sma(closes, 150), ma200 = sma(closes, 200);
   const ma200Prev = smaAt(closes, 200, 1);
-
-  const tr = trueRanges(bars);
-  const atr14 = sma(tr, 14);
-
-  const high52w = maxOver(highs, 252);
-  const low52w = minOver(lows, 252);
-
-  const { status, issues } = gradeBar(last, new Set());
+  const atr14 = sma(trueRanges(bars), 14); // needs >= 15 bars (14 true ranges)
+  const high52w = maxOver(highs, 252), low52w = minOver(lows, 252);
 
   return {
-    ticker: last.ticker,
-    date: last.date,
-    close: last.close,
+    ticker: last.ticker, date: last.date, close: last.close,
     dollarVolume: last.close * last.volume,
     ma20, ma50, ma150, ma200,
-    avgVolume20: sma(volumes, 20),
-    avgVolume50: sma(volumes, 50),
-    atr14,
-    high52w, low52w,
+    avgVolume20: sma(volumes, 20), avgVolume50: sma(volumes, 50),
+    atr14, high52w, low52w,
     distanceTo52wHighPct: high52w ? (last.close - high52w) / high52w * 100 : null,
     distanceFrom52wLowPct: low52w ? (last.close - low52w) / low52w * 100 : null,
-    return21d: pctReturn(closes, 21),
-    return63d: pctReturn(closes, 63),
-    return126d: pctReturn(closes, 126),
-    return252d: pctReturn(closes, 252),
+    return21d: pctReturn(closes, 21), return63d: pctReturn(closes, 63),
+    return126d: pctReturn(closes, 126), return252d: pctReturn(closes, 252),
     above20ma: ma20 === null ? null : last.close > ma20,
     above50ma: ma50 === null ? null : last.close > ma50,
     above150ma: ma150 === null ? null : last.close > ma150,
     above200ma: ma200 === null ? null : last.close > ma200,
     ma150Above200: ma150 !== null && ma200 !== null ? ma150 > ma200 : null,
     ma200Rising: ma200 !== null && ma200Prev !== null ? ma200 > ma200Prev : null,
-    qualityStatus: status,
-    qualityIssues: issues,
+    qualityStatus: quality.status, qualityIssues: quality.issues,
     ...prov,
   };
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `npx vitest run tests/metrics.test.ts`
-Expected: PASS.
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/metrics.test.ts` — Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add src/metrics.ts tests/metrics.test.ts
-git commit -m "feat: compute market metrics from trailing bars"
+git commit -m "feat: compute market metrics with injected quality"
 ```
 
 ---
 
-## Task 9: Secrets loader
+## Task 10: Secrets loader
 
-**Files:**
-- Create: `src/secrets.ts`
-- Test: `tests/secrets.test.ts`
+**Files:** Create `src/secrets.ts`; Test `tests/secrets.test.ts`
 
-**Interfaces:**
-- Produces: `parseSecret(json: string): Record<string,string>` and `loadSecrets(client, secretName): Promise<Record<string,string>>`. The Secrets Manager client is injected so tests need no AWS.
+**Interfaces:** `parseSecret(json): Record<string,string>`, `loadSecrets(client, secretName): Promise<Record<string,string>>` (client injected).
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1091,20 +1025,14 @@ import { describe, it, expect } from "vitest";
 import { parseSecret } from "../src/secrets.js";
 
 describe("parseSecret", () => {
-  it("parses the secret JSON blob", () => {
-    const s = parseSecret('{"finnhubToken":"abc","telegramBotToken":"t","telegramChatId":"1"}');
-    expect(s.finnhubToken).toBe("abc");
+  it("parses the secret blob", () => {
+    expect(parseSecret('{"finnhubToken":"abc"}').finnhubToken).toBe("abc");
   });
-  it("throws on malformed JSON", () => {
-    expect(() => parseSecret("not json")).toThrow();
-  });
+  it("throws on malformed JSON", () => { expect(() => parseSecret("not json")).toThrow(); });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/secrets.test.ts`
-Expected: FAIL — module not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/secrets.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/secrets.ts`**
 
@@ -1124,10 +1052,7 @@ export async function loadSecrets(client: SecretsManagerClient, secretName: stri
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `npx vitest run tests/secrets.test.ts`
-Expected: PASS.
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/secrets.test.ts` — Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1138,17 +1063,15 @@ git commit -m "feat: add Secrets Manager loader"
 
 ---
 
-## Task 10: S3 storage (Parquet writer + path builder)
+## Task 11: S3 storage (Parquet writers + path builders)
 
-**Files:**
-- Create: `src/storage.ts`
-- Test: `tests/storage.test.ts`
+**Files:** Create `src/storage.ts`; Test `tests/storage.test.ts`
 
 **Interfaces:**
-- Consumes: `RawBar`, `MetricRow`.
-- Produces:
-  - `rawKey(source, date, runId)`, `metricsKey(date, runId)` path builders.
-  - `writeRaw(s3, bucket, bars, source, date, runId)` and `writeMetrics(s3, bucket, rows, date, runId)` — serialize to Parquet (via `@dsnp/parquetjs`) and `PutObject`. The S3 client is injected.
+- `rawKey(source, date, runId)`, `metricsKey(date, runId)`.
+- `toParquet(schema, rows): Promise<Buffer>` (exported for the smoke test in Task 12).
+- `RAW_SCHEMA`, `METRIC_SCHEMA` (exported Parquet schemas).
+- `writeRaw(s3, bucket, rows: RawBarRow[], source, date, runId)`, `writeMetrics(s3, bucket, rows: MetricRow[], date, runId)`. `qualityIssues` is stored as a JSON string. S3 client injected.
 
 - [ ] **Step 1: Write the failing test (path builders)**
 
@@ -1158,67 +1081,50 @@ import { describe, it, expect } from "vitest";
 import { rawKey, metricsKey } from "../src/storage.js";
 
 describe("path builders", () => {
-  it("builds a partitioned raw key with runId and source", () => {
+  it("builds a raw key with source + runId", () => {
     expect(rawKey("finnhub", "2026-06-29", "20260629T223000Z")).toBe(
-      "raw/finnhub/daily/year=2026/month=06/day=29/runId=20260629T223000Z/part.parquet",
-    );
+      "raw/finnhub/daily/year=2026/month=06/day=29/runId=20260629T223000Z/part.parquet");
   });
-  it("builds a partitioned metrics key with runId", () => {
+  it("builds a metrics key with runId", () => {
     expect(metricsKey("2026-06-29", "20260629T223000Z")).toBe(
-      "metrics/daily/year=2026/month=06/day=29/runId=20260629T223000Z/part.parquet",
-    );
+      "metrics/daily/year=2026/month=06/day=29/runId=20260629T223000Z/part.parquet");
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/storage.test.ts`
-Expected: FAIL — module not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/storage.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/storage.ts`**
 
 ```ts
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { ParquetSchema, ParquetWriter } from "@dsnp/parquetjs";
-import type { RawBar, MetricRow } from "./types.js";
+import type { RawBarRow, MetricRow } from "./types.js";
 
 function parts(date: string): { year: string; month: string; day: string } {
   const [year, month, day] = date.split("-") as [string, string, string];
   return { year, month, day };
 }
-
 export function rawKey(source: string, date: string, runId: string): string {
   const { year, month, day } = parts(date);
   return `raw/${source}/daily/year=${year}/month=${month}/day=${day}/runId=${runId}/part.parquet`;
 }
-
 export function metricsKey(date: string, runId: string): string {
   const { year, month, day } = parts(date);
   return `metrics/daily/year=${year}/month=${month}/day=${day}/runId=${runId}/part.parquet`;
 }
 
-async function toParquet<T extends Record<string, unknown>>(schema: ParquetSchema, rows: T[]): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  const writer = await ParquetWriter.openStream(schema, {
-    write: (c: Buffer) => chunks.push(c),
-    end: () => {},
-  } as never);
-  for (const row of rows) await writer.appendRow(row);
-  await writer.close();
-  return Buffer.concat(chunks);
-}
-
-const RAW_SCHEMA = new ParquetSchema({
+export const RAW_SCHEMA = new ParquetSchema({
   ticker: { type: "UTF8" }, date: { type: "UTF8" },
-  open: { type: "DOUBLE" }, high: { type: "DOUBLE" }, low: { type: "DOUBLE" },
-  close: { type: "DOUBLE" }, adjustedClose: { type: "DOUBLE" }, volume: { type: "DOUBLE" },
+  open: { type: "DOUBLE" }, high: { type: "DOUBLE" }, low: { type: "DOUBLE" }, close: { type: "DOUBLE" },
+  adjustedClose: { type: "DOUBLE", optional: true }, isAdjusted: { type: "BOOLEAN" },
+  volume: { type: "DOUBLE" },
   source: { type: "UTF8" }, sourceVersion: { type: "UTF8" }, ingestedAt: { type: "UTF8" },
+  runId: { type: "UTF8" }, schemaVersion: { type: "UTF8" }, metricVersion: { type: "UTF8" }, universeVersion: { type: "UTF8" },
 });
 
-const METRIC_SCHEMA = new ParquetSchema({
-  ticker: { type: "UTF8" }, date: { type: "UTF8" }, close: { type: "DOUBLE" },
-  dollarVolume: { type: "DOUBLE" },
+export const METRIC_SCHEMA = new ParquetSchema({
+  ticker: { type: "UTF8" }, date: { type: "UTF8" }, close: { type: "DOUBLE" }, dollarVolume: { type: "DOUBLE" },
   ma20: { type: "DOUBLE", optional: true }, ma50: { type: "DOUBLE", optional: true },
   ma150: { type: "DOUBLE", optional: true }, ma200: { type: "DOUBLE", optional: true },
   avgVolume20: { type: "DOUBLE", optional: true }, avgVolume50: { type: "DOUBLE", optional: true },
@@ -1231,55 +1137,102 @@ const METRIC_SCHEMA = new ParquetSchema({
   above150ma: { type: "BOOLEAN", optional: true }, above200ma: { type: "BOOLEAN", optional: true },
   ma150Above200: { type: "BOOLEAN", optional: true }, ma200Rising: { type: "BOOLEAN", optional: true },
   qualityStatus: { type: "UTF8" }, qualityIssues: { type: "UTF8" },
-  runId: { type: "UTF8" }, ingestedAt: { type: "UTF8" }, source: { type: "UTF8" },
-  sourceVersion: { type: "UTF8" }, schemaVersion: { type: "UTF8" },
-  metricVersion: { type: "UTF8" }, universeVersion: { type: "UTF8" },
+  runId: { type: "UTF8" }, ingestedAt: { type: "UTF8" }, source: { type: "UTF8" }, sourceVersion: { type: "UTF8" },
+  schemaVersion: { type: "UTF8" }, metricVersion: { type: "UTF8" }, universeVersion: { type: "UTF8" },
 });
 
-export async function writeRaw(s3: S3Client, bucket: string, bars: RawBar[], source: string, date: string, runId: string): Promise<string> {
+export async function toParquet(schema: ParquetSchema, rows: Record<string, unknown>[]): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  const writer = await ParquetWriter.openStream(schema, {
+    write: (c: Buffer) => chunks.push(c), end: () => {},
+  } as never);
+  for (const row of rows) await writer.appendRow(row);
+  await writer.close();
+  return Buffer.concat(chunks);
+}
+
+export async function writeRaw(s3: S3Client, bucket: string, rows: RawBarRow[], source: string, date: string, runId: string): Promise<string> {
   const key = rawKey(source, date, runId);
-  const body = await toParquet(RAW_SCHEMA, bars as unknown as Record<string, unknown>[]);
+  const body = await toParquet(RAW_SCHEMA, rows as unknown as Record<string, unknown>[]);
   await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
   return key;
 }
 
 export async function writeMetrics(s3: S3Client, bucket: string, rows: MetricRow[], date: string, runId: string): Promise<string> {
   const key = metricsKey(date, runId);
-  const flat = rows.map((r) => ({ ...r, qualityIssues: r.qualityIssues.join(",") }));
+  const flat = rows.map((r) => ({ ...r, qualityIssues: JSON.stringify(r.qualityIssues) })); // JSON string, not comma-joined
   const body = await toParquet(METRIC_SCHEMA, flat as unknown as Record<string, unknown>[]);
   await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
   return key;
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/storage.test.ts` — Expected: PASS.
 
-Run: `npx vitest run tests/storage.test.ts`
-Expected: PASS (path builders).
-
-- [ ] **Step 5: Typecheck the Parquet code**
-
-Run: `npm run typecheck`
-Expected: exits 0. (If `@dsnp/parquetjs` stream typings complain, the `as never` cast on the writer sink is intentional; keep it.)
+- [ ] **Step 5: Typecheck** — Run: `npm run typecheck` — Expected: exits 0. (The `as never` cast on the writer sink is intentional; keep it.)
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/storage.ts tests/storage.test.ts
-git commit -m "feat: add S3 Parquet storage with partitioned runId paths"
+git commit -m "feat: add S3 Parquet storage (provenance, JSON qualityIssues)"
 ```
 
 ---
 
-## Task 11: History reader
+## Task 12: Parquet round-trip smoke test (early integration)
 
-**Files:**
-- Create: `src/history.ts`
-- Test: `tests/history.test.ts`
+**Files:** Test `tests/parquet-smoke.test.ts`
 
-**Interfaces:**
-- Consumes: `RawBar`.
-- Produces: `mergeHistory(stored: RawBar[], latest: RawBar): RawBar[]` — appends/sorts ascending by date, de-duping on date (latest wins). `hasEnoughHistory(bars, minSessions): boolean`. (Reading prior Parquet from S3 is wired in the pipeline; the testable logic is the merge + sufficiency check.)
+**Interfaces:** Consumes `toParquet`, `METRIC_SCHEMA` from Task 11. Proves a written Parquet buffer can be re-read with the expected schema and values — before any logic depends on it.
+
+- [ ] **Step 1: Write the smoke test**
+
+```ts
+// tests/parquet-smoke.test.ts
+import { describe, it, expect } from "vitest";
+import { ParquetReader } from "@dsnp/parquetjs";
+import { toParquet, METRIC_SCHEMA } from "../src/storage.js";
+
+describe("parquet round-trip", () => {
+  it("writes two metric rows and reads them back with correct types", async () => {
+    const rows = [
+      { ticker: "AAPL", date: "2026-06-29", close: 11, dollarVolume: 11000, ma20: 10.5, ma50: null, ma150: null, ma200: null, avgVolume20: null, avgVolume50: null, atr14: null, high52w: null, low52w: null, distanceTo52wHighPct: null, distanceFrom52wLowPct: null, return21d: null, return63d: null, return126d: null, return252d: null, above20ma: true, above50ma: null, above150ma: null, above200ma: null, ma150Above200: null, ma200Rising: null, qualityStatus: "OK", qualityIssues: JSON.stringify([]), runId: "R", ingestedAt: "x", source: "fake", sourceVersion: "1.0", schemaVersion: "metrics_v1", metricVersion: "1.0", universeVersion: "2026-06-29" },
+      { ticker: "MSFT", date: "2026-06-29", close: 20, dollarVolume: 40000, ma20: null, ma50: null, ma150: null, ma200: null, avgVolume20: null, avgVolume50: null, atr14: null, high52w: null, low52w: null, distanceTo52wHighPct: null, distanceFrom52wLowPct: null, return21d: null, return63d: null, return126d: null, return252d: null, above20ma: null, above50ma: null, above150ma: null, above200ma: null, ma150Above200: null, ma200Rising: null, qualityStatus: "WARN", qualityIssues: JSON.stringify(["zero_volume"]), runId: "R", ingestedAt: "x", source: "fake", sourceVersion: "1.0", schemaVersion: "metrics_v1", metricVersion: "1.0", universeVersion: "2026-06-29" },
+    ];
+    const buf = await toParquet(METRIC_SCHEMA, rows as unknown as Record<string, unknown>[]);
+    const reader = await ParquetReader.openBuffer(buf);
+    const cursor = reader.getCursor();
+    const read: Record<string, unknown>[] = [];
+    let rec: unknown;
+    while ((rec = await cursor.next())) read.push(rec as Record<string, unknown>);
+    await reader.close();
+
+    expect(read).toHaveLength(2);
+    expect(read[0]!.ticker).toBe("AAPL");
+    expect(read[0]!.above20ma).toBe(true);
+    expect(read[1]!.qualityStatus).toBe("WARN");
+    expect(JSON.parse(read[1]!.qualityIssues as string)).toEqual(["zero_volume"]);
+  });
+});
+```
+
+- [ ] **Step 2: Run the smoke test** — Run: `npx vitest run tests/parquet-smoke.test.ts` — Expected: PASS. If `@dsnp/parquetjs` cannot round-trip these types, STOP and resolve the library issue here — before building dependent logic. (The Glue/Athena column types in Task 20 mirror this schema, so a green round-trip is strong evidence Athena will read it.)
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add tests/parquet-smoke.test.ts
+git commit -m "test: add Parquet write/read round-trip smoke test"
+```
+
+---
+
+## Task 13: History merge logic
+
+**Files:** Create `src/history.ts`; Test `tests/history.test.ts`
+
+**Interfaces:** `mergeHistory(stored: VendorBar[], latest: VendorBar): VendorBar[]` (ascending, de-duped on date, latest wins). `hasEnoughHistory(bars, minSessions): boolean`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1287,57 +1240,45 @@ git commit -m "feat: add S3 Parquet storage with partitioned runId paths"
 // tests/history.test.ts
 import { describe, it, expect } from "vitest";
 import { mergeHistory, hasEnoughHistory } from "../src/history.js";
-import type { RawBar } from "../src/types.js";
+import type { VendorBar } from "../src/types.js";
 
-function bar(date: string, close: number): RawBar {
-  return { ticker: "AAPL", date, open: close, high: close, low: close, close, adjustedClose: close, volume: 1, source: "fake", sourceVersion: "1.0", ingestedAt: "x" };
-}
+const bar = (date: string, close: number): VendorBar => ({ ticker: "AAPL", date, open: close, high: close, low: close, close, adjustedClose: null, isAdjusted: false, volume: 1, source: "fake", sourceVersion: "1.0", ingestedAt: "x" });
 
 describe("mergeHistory", () => {
-  it("appends latest and keeps ascending order", () => {
-    const merged = mergeHistory([bar("2026-06-26", 1), bar("2026-06-27", 2)], bar("2026-06-29", 3));
-    expect(merged.map((b) => b.date)).toEqual(["2026-06-26", "2026-06-27", "2026-06-29"]);
+  it("appends latest, keeps ascending order", () => {
+    const m = mergeHistory([bar("2026-06-26", 1), bar("2026-06-27", 2)], bar("2026-06-29", 3));
+    expect(m.map((b) => b.date)).toEqual(["2026-06-26", "2026-06-27", "2026-06-29"]);
   });
-  it("replaces a same-date bar with the latest", () => {
-    const merged = mergeHistory([bar("2026-06-29", 1)], bar("2026-06-29", 9));
-    expect(merged).toHaveLength(1);
-    expect(merged[0]!.close).toBe(9);
+  it("replaces a same-date bar with latest", () => {
+    const m = mergeHistory([bar("2026-06-29", 1)], bar("2026-06-29", 9));
+    expect(m).toHaveLength(1); expect(m[0]!.close).toBe(9);
   });
 });
-
 describe("hasEnoughHistory", () => {
-  it("is false below the minimum", () => {
-    expect(hasEnoughHistory([bar("2026-06-29", 1)], 200)).toBe(false);
-  });
+  it("is false below the minimum", () => { expect(hasEnoughHistory([bar("2026-06-29", 1)], 200)).toBe(false); });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/history.test.ts`
-Expected: FAIL — module not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/history.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/history.ts`**
 
 ```ts
-import type { RawBar } from "./types.js";
+import type { VendorBar } from "./types.js";
 
-export function mergeHistory(stored: RawBar[], latest: RawBar): RawBar[] {
-  const byDate = new Map<string, RawBar>();
+export function mergeHistory(stored: VendorBar[], latest: VendorBar): VendorBar[] {
+  const byDate = new Map<string, VendorBar>();
   for (const b of stored) byDate.set(b.date, b);
   byDate.set(latest.date, latest); // latest wins on collision
   return [...byDate.values()].sort((a, b) => a.date.localeCompare(b.date));
 }
 
-export function hasEnoughHistory(bars: RawBar[], minSessions: number): boolean {
+export function hasEnoughHistory(bars: VendorBar[], minSessions: number): boolean {
   return bars.length >= minSessions;
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `npx vitest run tests/history.test.ts`
-Expected: PASS.
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/history.test.ts` — Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1348,15 +1289,97 @@ git commit -m "feat: add history merge and sufficiency check"
 
 ---
 
-## Task 12: Glue partition registration
+## Task 14: Per-ticker history cache (S3 JSON)
 
-**Files:**
-- Create: `src/glue.ts`
-- Test: `tests/glue.test.ts`
+**Files:** Create `src/historyCache.ts`; Test `tests/historyCache.test.ts`
 
 **Interfaces:**
-- Consumes: nothing app-specific.
-- Produces: `partitionValues(date)` → `[year, month, day]`; `addPartition(glue, db, table, bucket, prefix, date)` calls `BatchCreatePartition` and treats "already exists" as success (idempotent). Glue client injected.
+- `historyCacheKey(source, ticker): string` → `history/{source}/ticker={ticker}/current.json`.
+- `readHistoryCache(s3, bucket, source, ticker): Promise<VendorBar[]>` — returns `[]` on any miss/error.
+- `writeHistoryCache(s3, bucket, source, ticker, bars, maxBars=400): Promise<void>` — trims to the last `maxBars`. The cache is rebuildable from immutable raw, so it is not the source of truth.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// tests/historyCache.test.ts
+import { describe, it, expect } from "vitest";
+import { historyCacheKey, readHistoryCache, writeHistoryCache } from "../src/historyCache.js";
+import type { VendorBar } from "../src/types.js";
+
+const bar = (date: string): VendorBar => ({ ticker: "AAPL", date, open: 1, high: 1, low: 1, close: 1, adjustedClose: null, isAdjusted: false, volume: 1, source: "finnhub", sourceVersion: "1.0", ingestedAt: "x" });
+
+describe("historyCacheKey", () => {
+  it("builds the per-ticker key", () => {
+    expect(historyCacheKey("finnhub", "AAPL")).toBe("history/finnhub/ticker=AAPL/current.json");
+  });
+});
+
+describe("readHistoryCache", () => {
+  it("returns [] when the object is missing", async () => {
+    const s3 = { send: async () => { throw Object.assign(new Error("nope"), { name: "NoSuchKey" }); } } as never;
+    expect(await readHistoryCache(s3, "b", "finnhub", "AAPL")).toEqual([]);
+  });
+});
+
+describe("writeHistoryCache", () => {
+  it("trims to the last maxBars and PUTs JSON", async () => {
+    let body = "";
+    const s3 = { send: async (c: { input: { Body: string } }) => { body = c.input.Body; return {}; } } as never;
+    await writeHistoryCache(s3, "b", "finnhub", "AAPL", [bar("2026-06-25"), bar("2026-06-26"), bar("2026-06-29")], 2);
+    const parsed = JSON.parse(body) as VendorBar[];
+    expect(parsed.map((b) => b.date)).toEqual(["2026-06-26", "2026-06-29"]);
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/historyCache.test.ts` — Expected: FAIL.
+
+- [ ] **Step 3: Create `src/historyCache.ts`**
+
+```ts
+import { S3Client, GetObjectCommand, PutObjectCommand } from "@aws-sdk/client-s3";
+import type { VendorBar } from "./types.js";
+
+export function historyCacheKey(source: string, ticker: string): string {
+  return `history/${source}/ticker=${ticker}/current.json`;
+}
+
+export async function readHistoryCache(s3: S3Client, bucket: string, source: string, ticker: string): Promise<VendorBar[]> {
+  try {
+    const res = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: historyCacheKey(source, ticker) }));
+    const text = await res.Body!.transformToString();
+    const parsed = JSON.parse(text);
+    return Array.isArray(parsed) ? (parsed as VendorBar[]) : [];
+  } catch {
+    return []; // miss -> pipeline backfills
+  }
+}
+
+export async function writeHistoryCache(s3: S3Client, bucket: string, source: string, ticker: string, bars: VendorBar[], maxBars = 400): Promise<void> {
+  const trimmed = bars.slice(-maxBars);
+  await s3.send(new PutObjectCommand({
+    Bucket: bucket, Key: historyCacheKey(source, ticker),
+    Body: JSON.stringify(trimmed), ContentType: "application/json",
+  }));
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/historyCache.test.ts` — Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/historyCache.ts tests/historyCache.test.ts
+git commit -m "feat: add per-ticker history cache (S3 JSON, rebuildable)"
+```
+
+---
+
+## Task 15: Glue partition registration
+
+**Files:** Create `src/glue.ts`; Test `tests/glue.test.ts`
+
+**Interfaces:** `partitionValues(date) -> [year, month, day]`; `addPartition(glue, db, table, bucket, prefix, date)` calls `BatchCreatePartition`, treating "already exists" as success. Glue client injected.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1366,16 +1389,11 @@ import { describe, it, expect } from "vitest";
 import { partitionValues } from "../src/glue.js";
 
 describe("partitionValues", () => {
-  it("splits a date into year/month/day", () => {
-    expect(partitionValues("2026-06-29")).toEqual(["2026", "06", "29"]);
-  });
+  it("splits a date", () => { expect(partitionValues("2026-06-29")).toEqual(["2026", "06", "29"]); });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/glue.test.ts`
-Expected: FAIL — module not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/glue.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/glue.ts`**
 
@@ -1387,32 +1405,22 @@ export function partitionValues(date: string): [string, string, string] {
   return [y, m, d];
 }
 
-export async function addPartition(
-  glue: GlueClient, database: string, table: string, bucket: string, prefix: string, date: string,
-): Promise<void> {
+export async function addPartition(glue: GlueClient, database: string, table: string, bucket: string, prefix: string, date: string): Promise<void> {
   const [year, month, day] = partitionValues(date);
   const location = `s3://${bucket}/${prefix}/year=${year}/month=${month}/day=${day}/`;
   try {
     await glue.send(new BatchCreatePartitionCommand({
-      DatabaseName: database,
-      TableName: table,
-      PartitionInputList: [{
-        Values: [year, month, day],
-        StorageDescriptor: { Location: location },
-      }],
+      DatabaseName: database, TableName: table,
+      PartitionInputList: [{ Values: [year, month, day], StorageDescriptor: { Location: location } }],
     }));
   } catch (err) {
-    const name = (err as { name?: string }).name ?? "";
-    if (name.includes("AlreadyExists")) return; // idempotent
+    if (((err as { name?: string }).name ?? "").includes("AlreadyExists")) return; // idempotent
     throw err;
   }
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `npx vitest run tests/glue.test.ts`
-Expected: PASS.
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/glue.test.ts` — Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1423,17 +1431,11 @@ git commit -m "feat: add idempotent Glue partition registration"
 
 ---
 
-## Task 13: Metadata (manifest, current pointer, universe snapshot)
+## Task 16: Metadata (manifest, current pointer, universe snapshot)
 
-**Files:**
-- Create: `src/metadata.ts`
-- Test: `tests/metadata.test.ts`
+**Files:** Create `src/metadata.ts`; Test `tests/metadata.test.ts`
 
-**Interfaces:**
-- Consumes: `RunManifest`, `S3Client`.
-- Produces:
-  - `manifestKey(date, runId)`, `currentKey(date)`, `universeKey(date)` builders.
-  - `writeManifest(s3, bucket, manifest)`, `markCurrent(s3, bucket, manifest)` (only call on success), `snapshotUniverse(s3, bucket, date, universe)`.
+**Interfaces:** `manifestKey(date, runId)`, `currentKey(date)`, `universeKey(date)`; `writeManifest(s3, bucket, m)`, `markCurrent(s3, bucket, m)` (caller gates on status), `snapshotUniverse(s3, bucket, date, universe)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1443,24 +1445,13 @@ import { describe, it, expect } from "vitest";
 import { manifestKey, currentKey, universeKey } from "../src/metadata.js";
 
 describe("metadata keys", () => {
-  it("builds the manifest key", () => {
-    expect(manifestKey("2026-06-29", "20260629T223000Z")).toBe(
-      "metadata/runs/year=2026/month=06/day=29/runId=20260629T223000Z/manifest.json",
-    );
-  });
-  it("builds the current pointer key", () => {
-    expect(currentKey("2026-06-29")).toBe("metadata/current/daily_metrics/year=2026/month=06/day=29.json");
-  });
-  it("builds the universe snapshot key", () => {
-    expect(universeKey("2026-06-29")).toBe("metadata/universe/2026-06-29.json");
-  });
+  it("manifest key", () => { expect(manifestKey("2026-06-29", "20260629T223000Z")).toBe("metadata/runs/year=2026/month=06/day=29/runId=20260629T223000Z/manifest.json"); });
+  it("current key", () => { expect(currentKey("2026-06-29")).toBe("metadata/current/daily_metrics/year=2026/month=06/day=29.json"); });
+  it("universe key", () => { expect(universeKey("2026-06-29")).toBe("metadata/universe/2026-06-29.json"); });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/metadata.test.ts`
-Expected: FAIL — module not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/metadata.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/metadata.ts`**
 
@@ -1472,7 +1463,6 @@ function parts(date: string) {
   const [year, month, day] = date.split("-") as [string, string, string];
   return { year, month, day };
 }
-
 export function manifestKey(date: string, runId: string): string {
   const { year, month, day } = parts(date);
   return `metadata/runs/year=${year}/month=${month}/day=${day}/runId=${runId}/manifest.json`;
@@ -1481,16 +1471,11 @@ export function currentKey(date: string): string {
   const { year, month, day } = parts(date);
   return `metadata/current/daily_metrics/year=${year}/month=${month}/day=${day}.json`;
 }
-export function universeKey(date: string): string {
-  return `metadata/universe/${date}.json`;
-}
+export function universeKey(date: string): string { return `metadata/universe/${date}.json`; }
 
 async function putJson(s3: S3Client, bucket: string, key: string, value: unknown): Promise<void> {
-  await s3.send(new PutObjectCommand({
-    Bucket: bucket, Key: key, Body: JSON.stringify(value, null, 2), ContentType: "application/json",
-  }));
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: JSON.stringify(value, null, 2), ContentType: "application/json" }));
 }
-
 export async function writeManifest(s3: S3Client, bucket: string, m: RunManifest): Promise<void> {
   await putJson(s3, bucket, manifestKey(m.tradingDay, m.runId), m);
 }
@@ -1502,10 +1487,7 @@ export async function snapshotUniverse(s3: S3Client, bucket: string, date: strin
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `npx vitest run tests/metadata.test.ts`
-Expected: PASS.
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/metadata.test.ts` — Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1516,15 +1498,11 @@ git commit -m "feat: add manifest, current pointer, and universe snapshot writer
 
 ---
 
-## Task 14: Telegram report
+## Task 17: Telegram report
 
-**Files:**
-- Create: `src/report.ts`
-- Test: `tests/report.test.ts`
+**Files:** Create `src/report.ts`; Test `tests/report.test.ts`
 
-**Interfaces:**
-- Consumes: `RunManifest`.
-- Produces: `renderReport(m: RunManifest): string` and `sendTelegram(botToken, chatId, text, fetchFn?)`.
+**Interfaces:** `renderReport(m: RunManifest): string`, `sendTelegram(botToken, chatId, text, fetchFn?)`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1534,27 +1512,20 @@ import { describe, it, expect } from "vitest";
 import { renderReport } from "../src/report.js";
 import type { RunManifest } from "../src/types.js";
 
-const m: RunManifest = {
-  runId: "20260629T223000Z", mode: "daily", tradingDay: "2026-06-29", provider: "finnhub",
-  universeVersion: "2026-06-29", symbolsRequested: 612, symbolsSucceeded: 610, rowsWritten: 610,
-  warnings: 4, rejected: 2, runtimeSec: 302, metricVersion: "1.0", schemaVersion: "metrics_v1", status: "PARTIAL",
-};
+const m: RunManifest = { runId: "20260629T223000Z", mode: "daily", tradingDay: "2026-06-29", provider: "finnhub", universeVersion: "2026-06-29", symbolsRequested: 612, symbolsSucceeded: 610, rowsWritten: 610, warnings: 4, rejected: 2, missingBars: 0, runtimeSec: 302, metricVersion: "1.0", schemaVersion: "metrics_v1", status: "PARTIAL" };
 
 describe("renderReport", () => {
   it("includes key run stats", () => {
-    const text = renderReport(m);
-    expect(text).toContain("EdgeHub Daily Update");
-    expect(text).toContain("2026-06-29");
-    expect(text).toContain("610");
-    expect(text).toContain("PARTIAL");
+    const t = renderReport(m);
+    expect(t).toContain("EdgeHub Daily Update");
+    expect(t).toContain("2026-06-29");
+    expect(t).toContain("610");
+    expect(t).toContain("PARTIAL");
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/report.test.ts`
-Expected: FAIL — module not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/report.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/report.ts`**
 
@@ -1573,28 +1544,22 @@ export function renderReport(m: RunManifest): string {
     `Rows: ${m.rowsWritten}`,
     `Warnings: ${m.warnings}`,
     `Rejected: ${m.rejected}`,
+    `Missing bars: ${m.missingBars}`,
     `Metric Version: ${m.metricVersion}`,
     `Runtime: ${m.runtimeSec}s`,
     `Status: ${m.status}`,
   ].join("\n");
 }
 
-export async function sendTelegram(
-  botToken: string, chatId: string, text: string, fetchFn: FetchFn = fetch as unknown as FetchFn,
-): Promise<void> {
+export async function sendTelegram(botToken: string, chatId: string, text: string, fetchFn: FetchFn = fetch as unknown as FetchFn): Promise<void> {
   const res = await fetchFn(`https://api.telegram.org/bot${botToken}/sendMessage`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ chat_id: chatId, text }),
   });
   if (!res.ok) throw new Error(`telegram HTTP ${res.status}`);
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
-
-Run: `npx vitest run tests/report.test.ts`
-Expected: PASS.
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/report.test.ts` — Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -1605,26 +1570,22 @@ git commit -m "feat: add Telegram report rendering and sending"
 
 ---
 
-## Task 15: Pipeline orchestration
+## Task 18: Pipeline orchestration
 
-**Files:**
-- Create: `src/pipeline.ts`
-- Test: `tests/pipeline.test.ts`
+**Files:** Create `src/pipeline.ts`; Test `tests/pipeline.test.ts`
 
 **Interfaces:**
-- Consumes: everything above. To stay testable, the pipeline takes its AWS clients and provider via a `Deps` object so tests inject fakes.
-- Produces:
-  - `makeRunId(now: Date): string` → `YYYYMMDDTHHMMSSZ`.
-  - `runPipeline(mode, deps): Promise<RunManifest>` where `Deps = { provider, s3, glue, bucket, database, now, universe, readHistory }`.
-  - `readHistory(ticker): Promise<RawBar[]>` is injected (S3 read of prior Parquet) so the pipeline core is unit-testable with the fake provider.
+- `makeRunId(now: Date): string` → `YYYYMMDDTHHMMSSZ`.
+- `enrichRaw(bar: VendorBar, ctx: { runId: string; universeVersion: string }): RawBarRow`.
+- `buildManifest(args): RunManifest` — status: `SKIPPED` when not a trading day; `FAILURE` when success rate < floor (0.90) or zero; `PARTIAL` when below requested but ≥ floor; `SUCCESS` when all requested produced rows.
+- `runPipeline(mode, deps): Promise<RunManifest>` where `Deps = { provider, s3, glue, bucket, database, tradingDay, now, readHistory, writeHistory, isTradingDay }`. Records `missing_bar_for_date` per ticker; never writes a stale today row; advances `current` only on `SUCCESS`/`PARTIAL`.
 
-- [ ] **Step 1: Write the failing test (runId formatter)**
+- [ ] **Step 1: Write the failing test (runId + manifest)**
 
 ```ts
 // tests/pipeline.test.ts
 import { describe, it, expect } from "vitest";
 import { makeRunId, buildManifest } from "../src/pipeline.js";
-import type { MetricRow, Provenance } from "../src/types.js";
 
 describe("makeRunId", () => {
   it("formats a compact UTC timestamp", () => {
@@ -1633,28 +1594,20 @@ describe("makeRunId", () => {
 });
 
 describe("buildManifest", () => {
-  it("counts warnings, rejects, and sets PARTIAL when symbols fail", () => {
-    const prov: Provenance = { runId: "R", ingestedAt: "x", source: "fake", sourceVersion: "1.0", schemaVersion: "metrics_v1", metricVersion: "1.0", universeVersion: "2026-06-29" };
-    const rows: MetricRow[] = [
-      { ...stub(prov), qualityStatus: "OK", qualityIssues: [] },
-      { ...stub(prov), qualityStatus: "WARN", qualityIssues: ["zero_volume"] },
-    ];
-    const m = buildManifest({ mode: "daily", runId: "R", tradingDay: "2026-06-29", provider: "fake", universeVersion: "2026-06-29", requested: 3, rows, runtimeSec: 5 });
-    expect(m.symbolsSucceeded).toBe(2);
-    expect(m.warnings).toBe(1);
-    expect(m.status).toBe("PARTIAL"); // requested 3, got 2
+  const common = { mode: "daily" as const, runId: "R", tradingDay: "2026-06-29", provider: "fake", universeVersion: "2026-06-29", warnings: 0, rejected: 0, missingBars: 0, runtimeSec: 5 };
+  it("SUCCESS when all requested produce rows", () => {
+    expect(buildManifest({ ...common, requested: 10, succeeded: 10 }).status).toBe("SUCCESS");
+  });
+  it("PARTIAL when above the floor but short", () => {
+    expect(buildManifest({ ...common, requested: 10, succeeded: 9 }).status).toBe("PARTIAL");
+  });
+  it("FAILURE below the floor", () => {
+    expect(buildManifest({ ...common, requested: 10, succeeded: 5 }).status).toBe("FAILURE");
   });
 });
-
-function stub(prov: Provenance): MetricRow {
-  return { ticker: "AAPL", date: "2026-06-29", close: 1, dollarVolume: 1, ma20: null, ma50: null, ma150: null, ma200: null, avgVolume20: null, avgVolume50: null, atr14: null, high52w: null, low52w: null, distanceTo52wHighPct: null, distanceFrom52wLowPct: null, return21d: null, return63d: null, return126d: null, return252d: null, above20ma: null, above50ma: null, above150ma: null, above200ma: null, ma150Above200: null, ma200Rising: null, qualityStatus: "OK", qualityIssues: [], ...prov };
-}
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `npx vitest run tests/pipeline.test.ts`
-Expected: FAIL — module not found.
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/pipeline.test.ts` — Expected: FAIL.
 
 - [ ] **Step 3: Create `src/pipeline.ts`**
 
@@ -1662,8 +1615,8 @@ Expected: FAIL — module not found.
 import { S3Client } from "@aws-sdk/client-s3";
 import { GlueClient } from "@aws-sdk/client-glue";
 import type { MarketDataProvider } from "./providers/provider.js";
-import type { RawBar, MetricRow, RunManifest, RunMode, Provenance } from "./types.js";
-import { SCHEMA_VERSION, METRIC_VERSION } from "./types.js";
+import type { VendorBar, RawBarRow, MetricRow, RunManifest, RunMode, Provenance } from "./types.js";
+import { SCHEMA_VERSION, RAW_SCHEMA_VERSION, METRIC_VERSION } from "./types.js";
 import { loadUniverse } from "./universe.js";
 import { gradeBar } from "./validate.js";
 import { computeMetrics } from "./metrics.js";
@@ -1676,20 +1629,24 @@ export function makeRunId(now: Date): string {
   return now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
 }
 
-export interface BuildManifestArgs {
-  mode: RunMode; runId: string; tradingDay: string; provider: string;
-  universeVersion: string; requested: number; rows: MetricRow[]; runtimeSec: number;
+export function enrichRaw(bar: VendorBar, ctx: { runId: string; universeVersion: string }): RawBarRow {
+  return { ...bar, runId: ctx.runId, schemaVersion: RAW_SCHEMA_VERSION, metricVersion: METRIC_VERSION, universeVersion: ctx.universeVersion };
 }
 
+const MIN_SUCCESS_RATE = 0.9;
+
+export interface BuildManifestArgs {
+  mode: RunMode; runId: string; tradingDay: string; provider: string; universeVersion: string;
+  requested: number; succeeded: number; warnings: number; rejected: number; missingBars: number; runtimeSec: number;
+}
 export function buildManifest(a: BuildManifestArgs): RunManifest {
-  const warnings = a.rows.filter((r) => r.qualityStatus === "WARN").length;
-  const rejected = a.rows.filter((r) => r.qualityStatus === "REJECTED").length;
-  const succeeded = a.rows.length;
-  const status: RunManifest["status"] = succeeded === 0 ? "FAILURE" : succeeded < a.requested ? "PARTIAL" : "SUCCESS";
+  const rate = a.requested === 0 ? 0 : a.succeeded / a.requested;
+  const status: RunManifest["status"] =
+    a.succeeded === 0 || rate < MIN_SUCCESS_RATE ? "FAILURE" : a.succeeded < a.requested ? "PARTIAL" : "SUCCESS";
   return {
-    runId: a.runId, mode: a.mode, tradingDay: a.tradingDay, provider: a.provider,
-    universeVersion: a.universeVersion, symbolsRequested: a.requested, symbolsSucceeded: succeeded,
-    rowsWritten: succeeded, warnings, rejected, runtimeSec: a.runtimeSec,
+    runId: a.runId, mode: a.mode, tradingDay: a.tradingDay, provider: a.provider, universeVersion: a.universeVersion,
+    symbolsRequested: a.requested, symbolsSucceeded: a.succeeded, rowsWritten: a.succeeded,
+    warnings: a.warnings, rejected: a.rejected, missingBars: a.missingBars, runtimeSec: a.runtimeSec,
     metricVersion: METRIC_VERSION, schemaVersion: SCHEMA_VERSION, status,
   };
 }
@@ -1702,7 +1659,9 @@ export interface Deps {
   database: string;
   tradingDay: string;
   now: () => Date;
-  readHistory: (ticker: string) => Promise<RawBar[]>;
+  readHistory: (ticker: string) => Promise<VendorBar[]>;
+  writeHistory: (ticker: string, bars: VendorBar[]) => Promise<void>;
+  isTradingDay: (date: string) => boolean;
 }
 
 const MIN_SESSIONS = 200;
@@ -1713,41 +1672,56 @@ export async function runPipeline(mode: RunMode, deps: Deps): Promise<RunManifes
   const runId = makeRunId(deps.now());
   const { tickers, universeVersion } = loadUniverse();
 
+  // Calendar gate: skip non-trading days for scheduled daily runs.
+  if (mode === "daily" && !deps.isTradingDay(deps.tradingDay)) {
+    const manifest: RunManifest = {
+      runId, mode, tradingDay: deps.tradingDay, provider: deps.provider.name, universeVersion,
+      symbolsRequested: tickers.length, symbolsSucceeded: 0, rowsWritten: 0, warnings: 0, rejected: 0,
+      missingBars: 0, runtimeSec: 0, metricVersion: METRIC_VERSION, schemaVersion: SCHEMA_VERSION, status: "SKIPPED",
+    };
+    await writeManifest(deps.s3, deps.bucket, manifest); // do NOT advance current
+    return manifest;
+  }
+
   await snapshotUniverse(deps.s3, deps.bucket, deps.tradingDay, { universeVersion, tickers });
 
   const prov: Provenance = {
-    runId, ingestedAt: deps.now().toISOString(), source: deps.provider.name,
-    sourceVersion: deps.provider.version, schemaVersion: SCHEMA_VERSION,
-    metricVersion: METRIC_VERSION, universeVersion,
+    runId, ingestedAt: deps.now().toISOString(), source: deps.provider.name, sourceVersion: deps.provider.version,
+    schemaVersion: SCHEMA_VERSION, metricVersion: METRIC_VERSION, universeVersion,
   };
 
-  const rawToStore: RawBar[] = [];
+  const rawToStore: RawBarRow[] = [];
   const metricRows: MetricRow[] = [];
   const seen = new Set<string>();
+  let warnings = 0, rejected = 0, missingBars = 0;
 
   for (const ticker of tickers) {
     try {
-      let bars: RawBar[];
+      let bars: VendorBar[];
       if (mode === "backfill") {
         bars = await deps.provider.getHistory(ticker, LOOKBACK_DAYS);
       } else {
-        const stored = await deps.readHistory(ticker);
         const latest = (await deps.provider.getLatestBars(deps.tradingDay, [ticker]))[0];
-        if (!latest) continue;
+        if (!latest) { missingBars++; continue; } // missing today's bar -> recorded failure, NO fake row
+        const stored = await deps.readHistory(ticker);
         bars = mergeHistory(stored, latest);
         if (!hasEnoughHistory(bars, MIN_SESSIONS)) {
           bars = mergeHistory(await deps.provider.getHistory(ticker, LOOKBACK_DAYS), latest);
         }
       }
+      // The current session must be exactly tradingDay (daily) or the last backfilled bar.
       const today = bars[bars.length - 1];
-      if (!today) continue;
-      const grade = gradeBar(today, seen);
-      rawToStore.push(today);
-      if (grade.status === "REJECTED") continue;
-      metricRows.push(computeMetrics(bars, prov));
+      if (!today || (mode === "daily" && today.date !== deps.tradingDay)) { missingBars++; continue; }
+
+      const grade = gradeBar(today, seen); // single batch-level grading (shared seen set)
+      rawToStore.push(enrichRaw(today, { runId, universeVersion }));
+      if (grade.status === "REJECTED") { rejected++; continue; }
+      if (grade.status === "WARN") warnings++;
+
+      metricRows.push(computeMetrics(bars, prov, grade));
+      await deps.writeHistory(ticker, bars); // refresh cache for next run
     } catch {
-      // per-ticker failure is non-fatal; absence from metricRows lowers symbolsSucceeded
-      continue;
+      continue; // per-ticker failure is non-fatal
     }
   }
 
@@ -1762,80 +1736,88 @@ export async function runPipeline(mode: RunMode, deps: Deps): Promise<RunManifes
 
   const runtimeSec = Math.round((deps.now().getTime() - start) / 1000);
   const manifest = buildManifest({
-    mode, runId, tradingDay: deps.tradingDay, provider: deps.provider.name,
-    universeVersion, requested: tickers.length, rows: metricRows, runtimeSec,
+    mode, runId, tradingDay: deps.tradingDay, provider: deps.provider.name, universeVersion,
+    requested: tickers.length, succeeded: metricRows.length, warnings, rejected, missingBars, runtimeSec,
   });
 
   await writeManifest(deps.s3, deps.bucket, manifest);
-  if (manifest.status !== "FAILURE") await markCurrent(deps.s3, deps.bucket, manifest);
-
+  if (manifest.status === "SUCCESS" || manifest.status === "PARTIAL") {
+    await markCurrent(deps.s3, deps.bucket, manifest); // accepted runs only; never on FAILURE/SKIPPED
+  }
   return manifest;
 }
 ```
 
-- [ ] **Step 4: Add an end-to-end pipeline test with the fake provider**
+- [ ] **Step 4: Add an end-to-end backfill test with the fake provider**
 
 Append to `tests/pipeline.test.ts`:
 
 ```ts
 import { runPipeline } from "../src/pipeline.js";
 import { FakeProvider } from "../src/providers/fake.js";
-import type { RawBar } from "../src/types.js";
+import type { VendorBar } from "../src/types.js";
 
-function series(ticker: string, n: number): RawBar[] {
-  const bars: RawBar[] = [];
+function series(ticker: string, n: number): VendorBar[] {
+  const bars: VendorBar[] = [];
   for (let i = 0; i < n; i++) {
     const close = 100 + i;
-    bars.push({ ticker, date: `2025-01-${String((i % 28) + 1).padStart(2, "0")}`, open: close, high: close + 1, low: close - 1, close, adjustedClose: close, volume: 1000, source: "fake", sourceVersion: "1.0", ingestedAt: "x" });
+    bars.push({ ticker, date: `2025-01-${String((i % 28) + 1).padStart(2, "0")}`, open: close, high: close + 1, low: close - 1, close, adjustedClose: null, isAdjusted: false, volume: 1000, source: "fake", sourceVersion: "1.0", ingestedAt: "x" });
   }
   return bars;
 }
 
 describe("runPipeline (backfill, fake provider)", () => {
-  it("produces a SUCCESS manifest writing metrics for all tickers", async () => {
-    const hist = new Map<string, RawBar[]>([
-      ["AAPL", series("AAPL", 5)], ["MSFT", series("MSFT", 5)], ["GOOG", series("GOOG", 5)],
-      ["AMZN", series("AMZN", 5)], ["NVDA", series("NVDA", 5)], ["TSLA", series("TSLA", 5)],
-      ["AVGO", series("AVGO", 5)], ["SPY", series("SPY", 5)], ["QQQ", series("QQQ", 5)],
-    ]);
+  it("produces a SUCCESS manifest and writes metrics for all tickers", async () => {
+    const hist = new Map<string, VendorBar[]>(
+      ["AAPL", "MSFT", "GOOG", "AMZN", "NVDA", "TSLA", "AVGO", "SPY", "QQQ"].map((t) => [t, series(t, 5)]),
+    );
     const calls: string[] = [];
     const s3 = { send: async (c: unknown) => { calls.push((c as { constructor: { name: string } }).constructor.name); return {}; } } as never;
     const glue = { send: async () => ({}) } as never;
-    const manifest = await runPipeline("backfill", {
-      provider: new FakeProvider(hist), s3, glue, bucket: "b", database: "edgehub",
-      tradingDay: "2025-01-05", now: () => new Date("2025-01-05T22:30:00Z"),
-      readHistory: async () => [],
+    const written = new Map<string, VendorBar[]>();
+    const m = await runPipeline("backfill", {
+      provider: new FakeProvider(hist), s3, glue, bucket: "b", database: "edgehub", tradingDay: "2025-01-05",
+      now: () => new Date("2025-01-05T22:30:00Z"),
+      readHistory: async () => [], writeHistory: async (t, bars) => { written.set(t, bars); },
+      isTradingDay: () => true,
     });
-    expect(manifest.status).toBe("SUCCESS");
-    expect(manifest.rowsWritten).toBe(9);
+    expect(m.status).toBe("SUCCESS");
+    expect(m.rowsWritten).toBe(9);
     expect(calls).toContain("PutObjectCommand");
+    expect(written.size).toBe(9); // cache refreshed per ticker
+  });
+});
+
+describe("runPipeline (daily, non-trading day)", () => {
+  it("returns SKIPPED without fetching", async () => {
+    const s3 = { send: async () => ({}) } as never;
+    const glue = { send: async () => ({}) } as never;
+    const m = await runPipeline("daily", {
+      provider: new FakeProvider(new Map()), s3, glue, bucket: "b", database: "edgehub", tradingDay: "2026-07-04",
+      now: () => new Date("2026-07-04T22:30:00Z"),
+      readHistory: async () => [], writeHistory: async () => {}, isTradingDay: () => false,
+    });
+    expect(m.status).toBe("SKIPPED");
   });
 });
 ```
 
-- [ ] **Step 5: Run tests to verify they pass**
-
-Run: `npx vitest run tests/pipeline.test.ts`
-Expected: PASS (runId, buildManifest, end-to-end).
+- [ ] **Step 5: Run tests to verify they pass** — Run: `npx vitest run tests/pipeline.test.ts` — Expected: PASS (runId, manifest, backfill, skipped).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add src/pipeline.ts tests/pipeline.test.ts
-git commit -m "feat: orchestrate the daily pipeline with injected deps"
+git commit -m "feat: orchestrate pipeline (calendar gate, no stale rows, current policy)"
 ```
 
 ---
 
-## Task 16: Lambda handler
+## Task 19: Lambda handler
 
-**Files:**
-- Create: `src/handler.ts`, `src/historyReader.ts`, `events/daily.json`, `events/backfill.json`
-- Test: `tests/handler.test.ts`
+**Files:** Create `src/handler.ts`, `events/daily.json`, `events/backfill.json`; Test `tests/handler.test.ts`
 
-**Interfaces:**
-- Consumes: `runPipeline`, `loadSecrets`, `getProvider`.
-- Produces: `parseEvent(event): { mode: RunMode; tradingDay: string }` and the Lambda `handler`. `src/historyReader.ts` exports `makeS3HistoryReader(s3, bucket, source)` returning a `readHistory(ticker)` that lists+reads the most recent prior metrics... (raw) Parquet; on any error it returns `[]` so the pipeline auto-backfills.
+**Interfaces:** `parseEvent(event, now): { mode; tradingDay }` and `handler`. Wires real AWS clients, the calendar, and the history cache (`readHistory`/`writeHistory`) into `runPipeline`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1847,62 +1829,18 @@ import { parseEvent } from "../src/handler.js";
 describe("parseEvent", () => {
   it("defaults to daily mode and today's date", () => {
     const r = parseEvent({}, new Date("2026-06-29T22:30:00Z"));
-    expect(r.mode).toBe("daily");
-    expect(r.tradingDay).toBe("2026-06-29");
+    expect(r.mode).toBe("daily"); expect(r.tradingDay).toBe("2026-06-29");
   });
-  it("honors an explicit backfill mode and date", () => {
+  it("honors explicit backfill mode and date", () => {
     const r = parseEvent({ mode: "backfill", tradingDay: "2026-06-01" }, new Date());
-    expect(r.mode).toBe("backfill");
-    expect(r.tradingDay).toBe("2026-06-01");
+    expect(r.mode).toBe("backfill"); expect(r.tradingDay).toBe("2026-06-01");
   });
 });
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/handler.test.ts` — Expected: FAIL.
 
-Run: `npx vitest run tests/handler.test.ts`
-Expected: FAIL — module not found.
-
-- [ ] **Step 3: Create `src/historyReader.ts`**
-
-```ts
-import { S3Client, ListObjectsV2Command, GetObjectCommand } from "@aws-sdk/client-s3";
-import { ParquetReader } from "@dsnp/parquetjs";
-import type { RawBar } from "./types.js";
-
-/** Returns a readHistory(ticker) that loads prior raw bars from the newest stored runId.
- *  Any failure returns [] so the pipeline falls back to provider backfill. */
-export function makeS3HistoryReader(s3: S3Client, bucket: string, source: string): (ticker: string) => Promise<RawBar[]> {
-  return async (ticker: string): Promise<RawBar[]> => {
-    try {
-      const prefix = `raw/${source}/daily/`;
-      const listed = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix: prefix }));
-      const keys = (listed.Contents ?? []).map((o) => o.Key!).filter((k) => k.endsWith(".parquet")).sort();
-      const bars: RawBar[] = [];
-      for (const key of keys) {
-        const obj = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
-        const buf = Buffer.from(await obj.Body!.transformToByteArray());
-        const reader = await ParquetReader.openBuffer(buf);
-        const cursor = reader.getCursor();
-        let rec: unknown;
-        while ((rec = await cursor.next())) {
-          const b = rec as RawBar;
-          if (b.ticker === ticker) bars.push(b);
-        }
-        await reader.close();
-      }
-      return bars;
-    } catch {
-      return [];
-    }
-  };
-}
-```
-
-> Note: scanning all raw Parquet per ticker is acceptable for the seed universe. The §12 scale-out
-> (ticker partitioning / compaction) addresses this when the universe grows; not needed now.
-
-- [ ] **Step 4: Create `src/handler.ts`**
+- [ ] **Step 3: Create `src/handler.ts`**
 
 ```ts
 import { S3Client } from "@aws-sdk/client-s3";
@@ -1912,7 +1850,8 @@ import type { RunMode } from "./types.js";
 import { getProvider } from "./providers/factory.js";
 import { loadSecrets } from "./secrets.js";
 import { runPipeline } from "./pipeline.js";
-import { makeS3HistoryReader } from "./historyReader.js";
+import { readHistoryCache, writeHistoryCache } from "./historyCache.js";
+import { isTradingDay } from "./calendar.js";
 import { renderReport, sendTelegram } from "./report.js";
 
 export function parseEvent(event: { mode?: string; tradingDay?: string }, now: Date): { mode: RunMode; tradingDay: string } {
@@ -1937,9 +1876,10 @@ export async function handler(event: { mode?: string; tradingDay?: string } = {}
   const { mode, tradingDay } = parseEvent(event, new Date());
 
   const manifest = await runPipeline(mode, {
-    provider, s3, glue, bucket, database, tradingDay,
-    now: () => new Date(),
-    readHistory: makeS3HistoryReader(s3, bucket, provider.name),
+    provider, s3, glue, bucket, database, tradingDay, now: () => new Date(),
+    readHistory: (t) => readHistoryCache(s3, bucket, provider.name, t),
+    writeHistory: (t, bars) => writeHistoryCache(s3, bucket, provider.name, t, bars),
+    isTradingDay: (d) => isTradingDay(d),
   });
 
   await sendTelegram(secrets.telegramBotToken!, secrets.telegramChatId!, renderReport(manifest));
@@ -1947,7 +1887,7 @@ export async function handler(event: { mode?: string; tradingDay?: string } = {}
 }
 ```
 
-- [ ] **Step 5: Create event fixtures**
+- [ ] **Step 4: Create event fixtures**
 
 `events/daily.json`:
 ```json
@@ -1958,27 +1898,22 @@ export async function handler(event: { mode?: string; tradingDay?: string } = {}
 { "mode": "backfill", "tradingDay": "2026-06-29" }
 ```
 
-- [ ] **Step 6: Run tests + full suite + typecheck**
+- [ ] **Step 5: Run full suite + typecheck** — Run: `npx vitest run && npm run typecheck` — Expected: ALL tests PASS; typecheck exits 0.
 
-Run: `npx vitest run && npm run typecheck`
-Expected: ALL tests PASS; typecheck exits 0.
-
-- [ ] **Step 7: Commit**
+- [ ] **Step 6: Commit**
 
 ```bash
-git add src/handler.ts src/historyReader.ts events/ tests/handler.test.ts
-git commit -m "feat: add Lambda handler, S3 history reader, and event fixtures"
+git add src/handler.ts events/ tests/handler.test.ts
+git commit -m "feat: add Lambda handler wiring calendar + history cache"
 ```
 
 ---
 
-## Task 17: SAM template + deploy config
+## Task 20: SAM template + deploy config
 
-**Files:**
-- Create: `template.yaml`, `samconfig.toml`
+**Files:** Create `template.yaml`, `samconfig.toml`
 
-**Interfaces:**
-- Produces the deployable stack: bucket, Lambda, EventBridge Scheduler, Glue DB + 2 tables, Secret declaration, IAM. No unit test — verified with `sam validate` and `sam build`.
+**Interfaces:** Deployable stack (bucket, Lambda, EventBridge Scheduler, Glue DB + 2 tables, Secret declaration, IAM). Verified via `sam validate` / `sam build`.
 
 - [ ] **Step 1: Create `template.yaml`**
 
@@ -1998,8 +1933,7 @@ Resources:
     Type: AWS::S3::Bucket
     Properties:
       BucketName: edgehub-data
-      VersioningConfiguration:
-        Status: Enabled
+      VersioningConfiguration: { Status: Enabled }
 
   EdgeHubSecret:
     Type: AWS::SecretsManager::Secret
@@ -2011,8 +1945,7 @@ Resources:
     Type: AWS::Glue::Database
     Properties:
       CatalogId: !Ref AWS::AccountId
-      DatabaseInput:
-        Name: edgehub
+      DatabaseInput: { Name: edgehub }
 
   EdgeHubCollector:
     Type: AWS::Serverless::Function
@@ -2029,14 +1962,10 @@ Resources:
           METRIC_VERSION: "1.0"
           SOURCE_VERSION: "1.0"
       Policies:
-        - S3CrudPolicy:
-            BucketName: edgehub-data
+        - S3CrudPolicy: { BucketName: edgehub-data }
         - Statement:
             - Effect: Allow
-              Action:
-                - glue:BatchCreatePartition
-                - glue:GetPartition
-                - glue:GetTable
+              Action: [glue:BatchCreatePartition, glue:GetPartition, glue:GetTable]
               Resource: "*"
             - Effect: Allow
               Action: secretsmanager:GetSecretValue
@@ -2046,21 +1975,7 @@ Resources:
       BuildProperties:
         Format: esm
         Target: node20
-        EntryPoints:
-          - src/handler.ts
-
-  CollectorSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: edgehub-daily-630pm-et
-      ScheduleExpression: cron(30 18 ? * MON-FRI *)
-      ScheduleExpressionTimezone: America/New_York
-      FlexibleTimeWindow:
-        Mode: "OFF"
-      Target:
-        Arn: !GetAtt EdgeHubCollector.Arn
-        RoleArn: !GetAtt SchedulerRole.Arn
-        Input: '{"mode":"daily"}'
+        EntryPoints: [src/handler.ts]
 
   SchedulerRole:
     Type: AWS::IAM::Role
@@ -2080,6 +1995,18 @@ Resources:
                 Action: lambda:InvokeFunction
                 Resource: !GetAtt EdgeHubCollector.Arn
 
+  CollectorSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: edgehub-daily-630pm-et
+      ScheduleExpression: cron(30 18 ? * MON-FRI *)
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt EdgeHubCollector.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"mode":"daily"}'
+
   DailyBarsTable:
     Type: AWS::Glue::Table
     Properties:
@@ -2088,17 +2015,13 @@ Resources:
       TableInput:
         Name: daily_bars
         TableType: EXTERNAL_TABLE
-        PartitionKeys:
-          - { Name: year, Type: string }
-          - { Name: month, Type: string }
-          - { Name: day, Type: string }
+        PartitionKeys: [{ Name: year, Type: string }, { Name: month, Type: string }, { Name: day, Type: string }]
         Parameters: { classification: parquet }
         StorageDescriptor:
           Location: s3://edgehub-data/raw/finnhub/daily/
           InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
           OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
-          SerdeInfo:
-            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
           Columns:
             - { Name: ticker, Type: string }
             - { Name: date, Type: string }
@@ -2107,10 +2030,15 @@ Resources:
             - { Name: low, Type: double }
             - { Name: close, Type: double }
             - { Name: adjustedClose, Type: double }
+            - { Name: isAdjusted, Type: boolean }
             - { Name: volume, Type: double }
             - { Name: source, Type: string }
             - { Name: sourceVersion, Type: string }
             - { Name: ingestedAt, Type: string }
+            - { Name: runId, Type: string }
+            - { Name: schemaVersion, Type: string }
+            - { Name: metricVersion, Type: string }
+            - { Name: universeVersion, Type: string }
 
   DailyMetricsTable:
     Type: AWS::Glue::Table
@@ -2120,17 +2048,13 @@ Resources:
       TableInput:
         Name: daily_metrics
         TableType: EXTERNAL_TABLE
-        PartitionKeys:
-          - { Name: year, Type: string }
-          - { Name: month, Type: string }
-          - { Name: day, Type: string }
+        PartitionKeys: [{ Name: year, Type: string }, { Name: month, Type: string }, { Name: day, Type: string }]
         Parameters: { classification: parquet }
         StorageDescriptor:
           Location: s3://edgehub-data/metrics/daily/
           InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
           OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
-          SerdeInfo:
-            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
           Columns:
             - { Name: ticker, Type: string }
             - { Name: date, Type: string }
@@ -2192,15 +2116,9 @@ resolve_s3 = true
 fail_on_empty_changeset = false
 ```
 
-- [ ] **Step 3: Validate the template**
+- [ ] **Step 3: Validate** — Run: `sam validate --lint` — Expected: "valid SAM Template". (If SAM CLI is absent locally, CI Task 22 runs it; note and proceed.)
 
-Run: `sam validate --lint`
-Expected: "template.yaml is a valid SAM Template". (If SAM CLI is not installed locally, this step runs in CI in Task 19; note that here and proceed.)
-
-- [ ] **Step 4: Build**
-
-Run: `sam build`
-Expected: "Build Succeeded" — esbuild bundles `src/handler.ts`.
+- [ ] **Step 4: Build** — Run: `sam build` — Expected: "Build Succeeded" (esbuild bundles `src/handler.ts`).
 
 - [ ] **Step 5: Commit**
 
@@ -2211,20 +2129,16 @@ git commit -m "feat: add SAM template and deploy config"
 
 ---
 
-## Task 18: Data dictionary + bootstrap docs
+## Task 21: Data dictionary + bootstrap docs
 
-**Files:**
-- Create: `docs/DATA_DICTIONARY.md`, `docs/BOOTSTRAP.md`
-
-**Interfaces:**
-- Produces: human docs. No test; verified by review.
+**Files:** Create `docs/DATA_DICTIONARY.md`, `docs/BOOTSTRAP.md`
 
 - [ ] **Step 1: Create `docs/DATA_DICTIONARY.md`**
 
 ````markdown
 # EdgeHub Data Dictionary
 
-Generated from `config/metrics.ts` (the metric registry). When you add a metric there, add its row here.
+Generated from `config/metrics.ts` (the metric registry). Add a metric there → add its row here.
 
 ## daily_bars (raw)
 
@@ -2232,12 +2146,16 @@ Generated from `config/metrics.ts` (the metric registry). When you add a metric 
 |--------|------|---------|
 | ticker | string | Symbol |
 | date | string | Trading day, YYYY-MM-DD |
-| open/high/low/close | double | OHLC |
-| adjustedClose | double | Adjusted close (equals close on Finnhub free tier) |
+| open/high/low/close | double | OHLC (unadjusted) |
+| adjustedClose | double/null | Adjusted close; **null on Finnhub free tier** |
+| isAdjusted | boolean | Whether adjustedClose reflects splits/dividends (false for Finnhub free) |
 | volume | double | Share volume |
-| source | string | Provider name |
-| sourceVersion | string | Provider version |
-| ingestedAt | string | ISO timestamp of ingestion |
+| source / sourceVersion | string | Provider + version |
+| ingestedAt | string | ISO ingestion timestamp |
+| runId, schemaVersion, metricVersion, universeVersion | string | Provenance |
+
+> **Adjustment caveat:** Part 1 stores **unadjusted** Finnhub candles (`isAdjusted=false`, `adjustedClose=null`).
+> Do not treat `close` as split/dividend-adjusted. True adjustment + corporate actions arrive in Part 2.
 
 ## daily_metrics
 
@@ -2248,16 +2166,18 @@ Identity & provenance: ticker, date, runId, source, sourceVersion, schemaVersion
 | dollarVolume | — | close, volume | close × volume |
 | ma20 / ma50 / ma150 / ma200 | 20/50/150/200 | close | Simple moving averages |
 | avgVolume20 / avgVolume50 | 20/50 | volume | Average volume |
-| atr14 | 14 | high, low, close | Average true range (SMA of TR) |
+| atr14 | 14 | high, low, close | **SMA of the last 14 true ranges; requires ≥ 15 bars** |
 | high52w / low52w | 252 | high / low | 52-week extremes |
 | distanceTo52wHighPct | 252 | close, high | % distance to 52w high (≤ 0) |
 | distanceFrom52wLowPct | 252 | close, low | % distance above 52w low (≥ 0) |
 | return21d / 63d / 126d / 252d | 21/63/126/252 | close | Trailing returns |
 | above20ma / 50 / 150 / 200ma | — | close | close above the MA |
 | ma150Above200 | — | close | ma150 > ma200 |
-| ma200Rising | — | close | ma200 today > prior session |
+| ma200Rising | — | close | ma200 today > prior session (needs 201 bars) |
 | qualityStatus | — | — | OK / WARN / REJECTED |
-| qualityIssues | — | — | Comma-joined issue codes |
+| qualityIssues | — | — | **JSON-encoded string array** of issue codes |
+
+Any metric is `null` when its window exceeds available history.
 ````
 
 - [ ] **Step 2: Create `docs/BOOTSTRAP.md`**
@@ -2265,29 +2185,22 @@ Identity & provenance: ticker, date, runId, source, sourceVersion, schemaVersion
 ````markdown
 # EdgeHub Bootstrap (one-time manual setup)
 
-Do these once before the first GitHub deploy. They create the trust + secret that
-GitHub Actions itself cannot create.
+Run once before the first GitHub deploy — these create the trust + secret GitHub Actions cannot create for itself.
 
 ## 1. GitHub OIDC provider + deploy role
 
 ```bash
-# OIDC provider (skip if it already exists in the account)
 aws iam create-open-id-connect-provider \
   --url https://token.actions.githubusercontent.com \
   --client-id-list sts.amazonaws.com \
   --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
 
-# Deploy role trusting this repo's main branch (see trust-policy.json below)
 aws iam create-role --role-name edgehub-deploy \
   --assume-role-policy-document file://trust-policy.json
 
-# Attach deploy permissions (CloudFormation, S3, Lambda, IAM, Glue, Scheduler, SecretsManager).
-# For a personal project, PowerUserAccess + IAMFullAccess is the simple path;
-# tighten later.
-aws iam attach-role-policy --role-name edgehub-deploy \
-  --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
-aws iam attach-role-policy --role-name edgehub-deploy \
-  --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
+# Simple path for a personal project; tighten later.
+aws iam attach-role-policy --role-name edgehub-deploy --policy-arn arn:aws:iam::aws:policy/PowerUserAccess
+aws iam attach-role-policy --role-name edgehub-deploy --policy-arn arn:aws:iam::aws:policy/IAMFullAccess
 ```
 
 `trust-policy.json`:
@@ -2306,44 +2219,43 @@ aws iam attach-role-policy --role-name edgehub-deploy \
 }
 ```
 
-Add the role ARN as the GitHub repo variable `AWS_DEPLOY_ROLE_ARN`
-(Settings → Secrets and variables → Actions → Variables).
+Add the role ARN as GitHub repo **variable** `AWS_DEPLOY_ROLE_ARN` (Settings → Secrets and variables → Actions → Variables).
 
 ## 2. Secret value
-
-The SAM template declares `edgehub/secrets` but not its value. Set it once:
 
 ```bash
 aws secretsmanager put-secret-value --secret-id edgehub/secrets \
   --secret-string '{"finnhubToken":"<FINNHUB>","telegramBotToken":"<BOT>","telegramChatId":"<CHAT_ID>"}'
 ```
 
-## 3. First backfill
-
-After the first successful deploy, run a one-time backfill:
+## 3. First backfill (after first successful deploy)
 
 ```bash
 aws lambda invoke --function-name edgehub-daily-collector \
   --payload '{"mode":"backfill"}' --cli-binary-format raw-in-base64-out /dev/stdout
 ```
+
+## 4. Verify Athena
+
+In the Athena console (workgroup with an S3 results location set), run:
+```sql
+SELECT ticker, close, ma200, return252d FROM edgehub.daily_metrics LIMIT 20;
+```
+Expect rows for the latest partition.
 ````
 
 - [ ] **Step 3: Commit**
 
 ```bash
 git add docs/DATA_DICTIONARY.md docs/BOOTSTRAP.md
-git commit -m "docs: add data dictionary and bootstrap guide"
+git commit -m "docs: add data dictionary (adjustment caveat) and bootstrap guide"
 ```
 
 ---
 
-## Task 19: CI workflow
+## Task 22: CI workflow
 
-**Files:**
-- Create: `.github/workflows/ci.yml`
-
-**Interfaces:**
-- Produces: PR gate running typecheck, tests, and SAM validate/build. No deploy.
+**Files:** Create `.github/workflows/ci.yml`
 
 - [ ] **Step 1: Create `.github/workflows/ci.yml`**
 
@@ -2359,23 +2271,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
+        with: { node-version: "20", cache: npm }
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
       - uses: aws-actions/setup-sam@v2
-        with:
-          use-installer: true
+        with: { use-installer: true }
       - run: sam validate --lint
       - run: sam build
 ```
 
-- [ ] **Step 2: Verify locally what CI will run**
-
-Run: `npm ci && npm run typecheck && npm test`
-Expected: install clean, typecheck 0, all tests PASS. (The `sam` steps run on GitHub.)
+- [ ] **Step 2: Verify locally** — Run: `npm ci && npm run typecheck && npm test` — Expected: clean install, typecheck 0, all tests PASS.
 
 - [ ] **Step 3: Commit**
 
@@ -2386,13 +2292,11 @@ git commit -m "ci: add PR build-and-test workflow"
 
 ---
 
-## Task 20: Deploy workflow (GitHub → AWS via OIDC)
+## Task 23: Deploy workflow (GitHub → AWS via OIDC)
 
-**Files:**
-- Create: `.github/workflows/deploy.yml`
+**Files:** Create `.github/workflows/deploy.yml`
 
-**Interfaces:**
-- Produces: push-to-main deploy via OIDC. Consumes repo variable `AWS_DEPLOY_ROLE_ARN` (from BOOTSTRAP.md).
+**Interfaces:** Push-to-main deploy via OIDC. Consumes repo variable `AWS_DEPLOY_ROLE_ARN` (BOOTSTRAP.md).
 
 - [ ] **Step 1: Create `.github/workflows/deploy.yml`**
 
@@ -2412,9 +2316,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: npm
+        with: { node-version: "20", cache: npm }
       - run: npm ci
       - run: npm run typecheck && npm test
       - uses: aws-actions/configure-aws-credentials@v4
@@ -2422,8 +2324,7 @@ jobs:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: us-east-1
       - uses: aws-actions/setup-sam@v2
-        with:
-          use-installer: true
+        with: { use-installer: true }
       - run: sam build
       - run: sam deploy --no-confirm-changeset --no-fail-on-empty-changeset
 ```
@@ -2435,44 +2336,31 @@ git add .github/workflows/deploy.yml
 git commit -m "ci: add OIDC deploy-on-main workflow"
 ```
 
-- [ ] **Step 3: Push and verify the pipeline**
-
-```bash
-git push origin main
-```
-Expected: the **Deploy** workflow runs on GitHub, assumes the role via OIDC, and `sam deploy` creates/updates the `edgehub` stack. Verify in the GitHub Actions tab and the CloudFormation console. (Requires Task 18 bootstrap done first.)
+- [ ] **Step 3: Push and verify** — Run: `git push origin main` — Expected: the **Deploy** workflow assumes the role via OIDC and `sam deploy` creates/updates the `edgehub` stack. Verify in GitHub Actions + CloudFormation. (Requires Task 21 bootstrap first.)
 
 ---
 
 ## Self-Review
 
-**1. Spec coverage:**
-- IaC = SAM, compute = single Lambda → Tasks 16, 17. ✓
-- TypeScript/Node 20 → Task 1. ✓
-- Finnhub behind interface + factory + no hardcoded vendor → Tasks 5, 6; `source` from `provider.name` in storage/pipeline. ✓
-- OIDC deploy from main only → Tasks 18, 20. ✓
-- us-east-1 → Tasks 16, 17, 20. ✓
-- Committed versioned universe → Task 4. ✓
-- metrics naming (dir/table/version) → Tasks 2, 3, 8, 10, 17. ✓
-- Parquet via `@dsnp/parquetjs` → Task 10. ✓
-- Backfill vs daily + auto-backfill + history reader → Tasks 11, 15, 16. ✓
-- runId paths + metadata/current + never advance on FAILURE → Tasks 10, 13, 15. ✓
-- Provenance incl. universeVersion on every row → Tasks 2, 8, 15. ✓
-- Run manifest → Tasks 2, 13, 15. ✓
-- Universe versioning + per-day snapshot → Tasks 4, 13, 15. ✓
-- Metric registry + schema registry + data dictionary → Tasks 3, 18. ✓
-- Quality OK/WARN/REJECTED, WARN stored, REJECTED logged → Tasks 7, 8, 15. ✓
-- EventBridge Scheduler w/ America/New_York → Task 17. ✓
-- Glue daily_bars + daily_metrics → Tasks 12, 17. ✓
-- Telegram report from manifest → Tasks 14, 16. ✓
-- Reserved labels/ + corporate_actions/ → see note below. ✓
-- Testing (unit + schema + local) → Tasks 2–16, plus `invoke:local` script (Task 1) + events (Task 16). ✓
+**1. Spec + review-feedback coverage:**
+- VendorBar vs RawBarRow split (review #1) → Tasks 2, 6, 7, 18 (`enrichRaw`). ✓
+- No fake adjustedClose; `isAdjusted`/null (review #2) → Tasks 2, 7, 21. ✓
+- No stale-bar fallback; `missing_bar_for_date` (review #3) → Tasks 6, 7 (exact-date), 18 (missingBars). ✓
+- History cache replaces S3 scan (review #4) → Tasks 14, 18, 19. ✓
+- Market calendar (review #5) → Tasks 4, 18 (gate), 19. ✓
+- qualityIssues as JSON (review #6) → Tasks 11, 12, 21. ✓
+- Early Parquet smoke test (review #7) → Task 12. ✓
+- current advances only on SUCCESS/PARTIAL (review #8) → Tasks 16, 18. ✓
+- Duplicate detection at batch level, quality injected (medium #7) → Tasks 8, 9, 18. ✓
+- ATR ≥15-bar note (medium #8) → Tasks 3, 9, 21. ✓
+- SAM/single Lambda/OIDC/us-east-1/metrics naming/Parquet/registry/Glue tables/Telegram/Scheduler → Tasks 20, 1, 23, 3, 11, 15, 17. ✓
+- Universe versioning + snapshot, runId immutability, manifest → Tasks 5, 16, 18. ✓
 
-**2. Placeholder scan:** No "TBD"/"add error handling"/"similar to Task N". Each code step shows full code. ✓
+**2. Placeholder scan:** No "TBD"/"add error handling"/"similar to Task N". Every code step shows complete code. ✓
 
-**3. Type consistency:** `MarketDataProvider` (name, version, getLatestBars, getHistory) consistent across Tasks 5/6/15/16. `RawBar`/`MetricRow`/`Provenance`/`RunManifest` defined in Task 2 and used unchanged. `runId` paths identical in storage (Task 10) and metadata (Task 13). `gradeBar(bar, seen)` signature consistent Tasks 7/8/15. ✓
+**3. Type consistency:** `VendorBar`/`RawBarRow`/`MetricRow`/`Provenance`/`RunManifest` defined in Task 2, used unchanged downstream. `MarketDataProvider` returns `VendorBar[]` consistently (Tasks 6/7/18/19). `computeMetrics(bars, prov, quality)` matches caller in Task 18. `gradeBar(bar, seen)` consistent Tasks 8/18. `readHistory`/`writeHistory`/`isTradingDay` in `Deps` (Task 18) match handler wiring (Task 19). runId paths identical in storage (11), metadata (16). ✓
 
-**Gap found & fixed:** Reserved `labels/` and `corporate_actions/` prefixes were in the spec but not in any task (S3 prefixes only materialize on first write). Resolution: they require no infra (S3 has no real "folders"); the first object written under them in Part 2 creates them. To make the reservation explicit now, the data dictionary/bootstrap note their existence. No separate task needed — documented here so it isn't mistaken for an omission.
+**Note on reserved prefixes:** `labels/` and `corporate_actions/` need no task — S3 has no real folders; the first Part 2 write creates them. Documented, not omitted.
 
 ---
 
