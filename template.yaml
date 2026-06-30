@@ -31,7 +31,7 @@ Resources:
         Variables:
           BUCKET_NAME: !Ref DataBucket
           GLUE_DATABASE: edgehub
-          DATA_PROVIDER: finnhub
+          DATA_PROVIDER: stooq
           SCHEMA_VERSION: metrics_v1
           METRIC_VERSION: "1.0"
           SOURCE_VERSION: "1.0"
@@ -99,7 +99,7 @@ Resources:
         PartitionKeys: [{ Name: year, Type: string }, { Name: month, Type: string }, { Name: day, Type: string }]
         Parameters: { classification: parquet }
         StorageDescriptor:
-          Location: !Sub "s3://${DataBucket}/raw/finnhub/daily/"
+          Location: !Sub "s3://${DataBucket}/raw/stooq/daily/"
           InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
           OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
           SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
