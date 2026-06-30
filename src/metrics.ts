@@ -38,7 +38,7 @@ export function computeMetrics(bars: VendorBar[], prov: Provenance, quality: { s
   const high52w = maxOver(highs, 252), low52w = minOver(lows, 252);
 
   return {
-    ticker: last.ticker, date: last.date, close: last.close,
+    ticker: last.ticker, instrumentId: last.ticker, date: last.date, close: last.close,
     dollarVolume: last.close * last.volume,
     ma20, ma50, ma150, ma200,
     avgVolume20: sma(volumes, 20), avgVolume50: sma(volumes, 50),

@@ -17,7 +17,7 @@ export function makeRunId(now: Date): string {
 }
 
 export function enrichRaw(bar: VendorBar, ctx: { runId: string; universeVersion: string }): RawBarRow {
-  return { ...bar, runId: ctx.runId, schemaVersion: RAW_SCHEMA_VERSION, metricVersion: METRIC_VERSION, universeVersion: ctx.universeVersion };
+  return { instrumentId: bar.ticker, ...bar, runId: ctx.runId, schemaVersion: RAW_SCHEMA_VERSION, metricVersion: METRIC_VERSION, universeVersion: ctx.universeVersion };
 }
 
 const MIN_SUCCESS_RATE = 0.9;
@@ -33,7 +33,9 @@ export function buildManifest(a: BuildManifestArgs): RunManifest {
   return {
     runId: a.runId, mode: a.mode, tradingDay: a.tradingDay, provider: a.provider, universeVersion: a.universeVersion,
     symbolsRequested: a.requested, symbolsSucceeded: a.succeeded, rowsWritten: a.succeeded,
-    warnings: a.warnings, rejected: a.rejected, missingBars: a.missingBars, runtimeSec: a.runtimeSec,
+    warnings: a.warnings, rejected: a.rejected, missingBars: a.missingBars,
+    securitiesMastered: 0, securitiesResolved: 0, unresolvedTickers: 0, missingReferenceData: 0, aliasRows: 0,
+    runtimeSec: a.runtimeSec,
     metricVersion: METRIC_VERSION, schemaVersion: SCHEMA_VERSION, status,
   };
 }
@@ -64,7 +66,8 @@ export async function runPipeline(mode: RunMode, deps: Deps): Promise<RunManifes
   const earlyExit = (status: RunManifest["status"], note: string): RunManifest => ({
     runId, mode, tradingDay: deps.tradingDay, provider: deps.provider.name, universeVersion,
     symbolsRequested: tickers.length, symbolsSucceeded: 0, rowsWritten: 0, warnings: 0, rejected: 0,
-    missingBars: 0, runtimeSec: 0, metricVersion: METRIC_VERSION, schemaVersion: SCHEMA_VERSION, status, note,
+    missingBars: 0, securitiesMastered: 0, securitiesResolved: 0, unresolvedTickers: 0, missingReferenceData: 0, aliasRows: 0,
+    runtimeSec: 0, metricVersion: METRIC_VERSION, schemaVersion: SCHEMA_VERSION, status, note,
   });
 
   // Fail safely if the calendar does not cover this year — never guess holidays.

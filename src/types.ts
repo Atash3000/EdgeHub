@@ -1,5 +1,5 @@
-export const SCHEMA_VERSION = "metrics_v1";
-export const RAW_SCHEMA_VERSION = "dailyBars_v1";
+export const SCHEMA_VERSION = "metrics_v2";
+export const RAW_SCHEMA_VERSION = "dailyBars_v2";
 export const METRIC_VERSION = "1.0";
 export const SOURCE_VERSION = "1.0";
 
@@ -32,6 +32,63 @@ export interface Provenance {
   universeVersion: string;
 }
 
+export type IdentitySource =
+  | "SHARE_CLASS_FIGI" | "COMPOSITE_FIGI"
+  | "EH_CIK_TICKER" | "EH_TICKER_EXCHANGE" | "EH_TICKER";
+export type IdentityConfidence = "HIGH" | "MEDIUM" | "LOW";
+export type ReferenceStatus = "FOUND" | "MISSING_FALLBACK";
+
+export interface SecurityMasterRow {
+  instrumentId: string;
+  ticker: string;
+  tickerRoot?: string;
+  tickerSuffix?: string;
+  name?: string;
+  market?: string;
+  locale?: string;
+  type?: string;
+  currencyName?: string;
+  cik?: string;
+  compositeFigi?: string;
+  shareClassFigi?: string;
+  primaryExchange?: string;
+  active: boolean;
+  listDate?: string;
+  delistedUtc?: string;
+  lastUpdatedUtc?: string;
+  identitySource: IdentitySource;
+  identityConfidence: IdentityConfidence;
+  referenceStatus: ReferenceStatus;
+  source: string;
+  sourceVersion: string;
+  asOfDate: string;
+  ingestedAt: string;
+}
+
+export interface SymbolAliasRow {
+  instrumentId: string;
+  ticker: string;
+  tickerRoot?: string;
+  tickerSuffix?: string;
+  primaryExchange?: string;
+  validFrom: string;
+  validTo: string | null;
+  source: string;
+  sourceVersion: string;
+  asOfDate: string;
+  confidence: "HIGH" | "MEDIUM" | "LOW";
+  createdAt: string;
+}
+
+export interface ResolvedVendorBar extends VendorBar {
+  instrumentId: string;
+}
+
+export interface SecurityMasterResult {
+  securities: SecurityMasterRow[];
+  failures: ProviderFailure[];
+}
+
 /** A per-ticker fetch failure — collected, never thrown, so one bad ticker can't kill the run. */
 export interface ProviderFailure {
   ticker: string;
@@ -53,13 +110,14 @@ export interface ErrorRecord {
   source: string;
   universeVersion: string;
   ticker: string;
-  reason: string;   // provider_error | missing_bar_for_date | rejected | warn | pipeline_error | calendar_year_missing
+  reason: string;   // provider_error | missing_bar_for_date | rejected | warn | pipeline_error | calendar_year_missing | unresolved_instrument | duplicate_instrument_ticker | missing_reference_data | security_master_empty | alias_conflict | identity_changed
   message?: string;
   createdAt: string;
 }
 
 /** Stored raw row = vendor bar enriched with full provenance by the pipeline. */
 export interface RawBarRow extends VendorBar {
+  instrumentId: string;
   runId: string;
   schemaVersion: string; // RAW_SCHEMA_VERSION
   metricVersion: string;
@@ -67,6 +125,7 @@ export interface RawBarRow extends VendorBar {
 }
 
 export interface MetricRow extends Provenance {
+  instrumentId: string;
   ticker: string;
   date: string;
   close: number;
@@ -108,6 +167,11 @@ export interface RunManifest {
   warnings: number;
   rejected: number;
   missingBars: number;
+  securitiesMastered: number;
+  securitiesResolved: number;
+  unresolvedTickers: number;
+  missingReferenceData: number;
+  aliasRows: number;
   runtimeSec: number;
   metricVersion: string;
   schemaVersion: string;
