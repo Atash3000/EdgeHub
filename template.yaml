@@ -49,7 +49,10 @@ Resources:
     Metadata:
       BuildMethod: esbuild
       BuildProperties:
-        Format: esm
+        # cjs: esbuild transpiles our ESM source to CommonJS so the Lambda runtime loads
+        # handler.js without an "import statement outside a module" error (the deployed
+        # artifact has no type:module to mark .js as ESM).
+        Format: cjs
         Target: node24
         EntryPoints: [src/handler.ts]
 
