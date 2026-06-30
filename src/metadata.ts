@@ -24,6 +24,9 @@ export async function writeManifest(s3: S3Client, bucket: string, m: RunManifest
 export async function markCurrent(s3: S3Client, bucket: string, m: RunManifest): Promise<void> {
   await putJson(s3, bucket, currentKey(m.tradingDay), { runId: m.runId, status: m.status, rowCount: m.rowsWritten });
 }
-export async function snapshotUniverse(s3: S3Client, bucket: string, date: string, universe: { universeVersion: string; tickers: string[] }): Promise<void> {
+export async function snapshotUniverse(
+  s3: S3Client, bucket: string, date: string,
+  universe: { universeVersion: string; tickers: string[]; securities: { instrumentId: string; ticker: string; source: string; active: boolean }[] },
+): Promise<void> {
   await putJson(s3, bucket, universeKey(date), universe);
 }

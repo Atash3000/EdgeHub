@@ -9,7 +9,7 @@ describe("makeRunId", () => {
 });
 
 describe("buildManifest", () => {
-  const common = { mode: "daily" as const, runId: "R", tradingDay: "2026-06-29", provider: "fake", universeVersion: "2026-06-29", warnings: 0, rejected: 0, missingBars: 0, runtimeSec: 5 };
+  const common = { mode: "daily" as const, runId: "R", tradingDay: "2026-06-29", provider: "fake", universeVersion: "2026-06-29", warnings: 0, rejected: 0, missingBars: 0, runtimeSec: 5, securitiesMastered: 0, securitiesResolved: 0, unresolvedTickers: 0, missingReferenceData: 0, aliasRows: 0 };
   it("SUCCESS when all requested produce rows", () => {
     expect(buildManifest({ ...common, requested: 10, succeeded: 10 }).status).toBe("SUCCESS");
   });
@@ -161,7 +161,7 @@ describe("runPipeline (daily, old-date replay does NOT truncate cache)", () => {
       provider: new FakeProvider(hist), s3, glue, bucket: "b", database: "edgehub",
       tradingDay: replayDate,
       now: () => new Date("2025-03-03T22:30:00Z"),
-      readHistory: async (t) => (t === "AAPL" ? aaplStoredCache : []),
+      readHistory: async (t) => (t === "EH:AAPL" ? aaplStoredCache : []),
       writeHistory: async (t, bars) => { cacheWrites.set(t, bars.map((b) => b.date)); },
       isTradingDay: () => true,
       previousTradingDay: (d) => d,
@@ -169,7 +169,7 @@ describe("runPipeline (daily, old-date replay does NOT truncate cache)", () => {
     });
     expect(m.status).toMatch(/^(SUCCESS|PARTIAL)$/);
     // AAPL's cache write must include the future bar — cache must NOT be truncated at effectiveDate
-    const written = cacheWrites.get("AAPL");
+    const written = cacheWrites.get("EH:AAPL");
     expect(written).toBeDefined();
     expect(written).toContain(futureDate);
     // Metric partition is still the replay date, not the future date
@@ -202,5 +202,35 @@ describe("runPipeline (daily, old-date replay ignores future cache bars)", () =>
     expect(m.status).toMatch(/^(SUCCESS|PARTIAL)$/);
     expect(partitionDates).toContainEqual(["2025", "03", "03"]);
     expect(partitionDates).not.toContainEqual(["2025", "06", "01"]);
+  });
+});
+
+describe("runPipeline (daily, identity layer)", () => {
+  it("masters securities, resolves all bars, and mints EH: fallback for missing reference data", async () => {
+    const day = "2025-01-06";
+    const tickers = ["AAPL", "MSFT", "GOOG", "AMZN", "NVDA", "TSLA", "AVGO", "SPY", "QQQ"];
+    const bar = (t: string): VendorBar => ({ ticker: t, date: day, open: 10, high: 11, low: 9, close: 10, adjustedClose: null, isAdjusted: false, volume: 1000, source: "fake", sourceVersion: "1.0", ingestedAt: "x" });
+    const hist = new Map(tickers.map((t) => [t, [bar(t)]]));
+    // provider returns reference data for everything EXCEPT AAPL -> AAPL must be minted EH:AAPL
+    const securities = tickers.filter((t) => t !== "AAPL").map((t) => ({
+      instrumentId: `BBG_${t}`, ticker: t, tickerRoot: t, active: true,
+      identitySource: "SHARE_CLASS_FIGI" as const, identityConfidence: "HIGH" as const, referenceStatus: "FOUND" as const,
+      source: "fake", sourceVersion: "1.0", asOfDate: day, ingestedAt: "x",
+    }));
+    const putKeys: string[] = [];
+    const s3 = { send: async (c: any) => { if (c.input?.Key) putKeys.push(c.input.Key); return {}; } } as never;
+    const glue = { send: async (c: any) => (c.constructor.name === "GetTableCommand" ? { Table: { StorageDescriptor: { Columns: [], SerdeInfo: {} } } } : {}) } as never;
+    const m = await runPipeline("daily", {
+      provider: new FakeProvider(hist, securities), s3, glue, bucket: "b", database: "edgehub", tradingDay: day,
+      now: () => new Date(`${day}T22:30:00Z`),
+      readHistory: async () => [], writeHistory: async () => {},
+      isTradingDay: () => true, previousTradingDay: () => "2025-01-05", calendarCovers: () => true,
+    });
+    expect(m.securitiesMastered).toBe(9);
+    expect(m.missingReferenceData).toBe(1);   // AAPL
+    expect(m.unresolvedTickers).toBe(0);       // EH:AAPL still resolves
+    expect(m.securitiesResolved).toBe(9);
+    expect(putKeys.some((k) => k.startsWith("reference/securities/asOf="))).toBe(true);
+    expect(putKeys.some((k) => k.startsWith("reference/symbol_aliases/asOf="))).toBe(true);
   });
 });

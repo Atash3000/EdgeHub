@@ -1,7 +1,7 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { ParquetSchema, ParquetWriter } from "@dsnp/parquetjs";
 import { Writable } from "stream";
-import type { RawBarRow, MetricRow } from "./types.js";
+import type { RawBarRow, MetricRow, SecurityMasterRow, SymbolAliasRow } from "./types.js";
 
 function parts(date: string): { year: string; month: string; day: string } {
   const [year, month, day] = date.split("-") as [string, string, string];
@@ -17,6 +17,7 @@ export function metricsKey(date: string, runId: string): string {
 }
 
 export const RAW_SCHEMA = new ParquetSchema({
+  instrumentId: { type: "UTF8" },
   ticker: { type: "UTF8" }, date: { type: "UTF8" },
   open: { type: "DOUBLE" }, high: { type: "DOUBLE" }, low: { type: "DOUBLE" }, close: { type: "DOUBLE" },
   adjustedClose: { type: "DOUBLE", optional: true }, isAdjusted: { type: "BOOLEAN" },
@@ -26,6 +27,7 @@ export const RAW_SCHEMA = new ParquetSchema({
 });
 
 export const METRIC_SCHEMA = new ParquetSchema({
+  instrumentId: { type: "UTF8" },
   ticker: { type: "UTF8" }, date: { type: "UTF8" }, close: { type: "DOUBLE" }, dollarVolume: { type: "DOUBLE" },
   ma20: { type: "DOUBLE", optional: true }, ma50: { type: "DOUBLE", optional: true },
   ma150: { type: "DOUBLE", optional: true }, ma200: { type: "DOUBLE", optional: true },
@@ -42,6 +44,53 @@ export const METRIC_SCHEMA = new ParquetSchema({
   runId: { type: "UTF8" }, ingestedAt: { type: "UTF8" }, source: { type: "UTF8" }, sourceVersion: { type: "UTF8" },
   schemaVersion: { type: "UTF8" }, metricVersion: { type: "UTF8" }, universeVersion: { type: "UTF8" },
 });
+
+export const SECURITIES_SCHEMA = new ParquetSchema({
+  instrumentId: { type: "UTF8" }, ticker: { type: "UTF8" },
+  tickerRoot: { type: "UTF8", optional: true }, tickerSuffix: { type: "UTF8", optional: true },
+  name: { type: "UTF8", optional: true }, market: { type: "UTF8", optional: true },
+  locale: { type: "UTF8", optional: true }, type: { type: "UTF8", optional: true },
+  currencyName: { type: "UTF8", optional: true },
+  cik: { type: "UTF8", optional: true }, compositeFigi: { type: "UTF8", optional: true },
+  shareClassFigi: { type: "UTF8", optional: true }, primaryExchange: { type: "UTF8", optional: true },
+  active: { type: "BOOLEAN" },
+  listDate: { type: "UTF8", optional: true }, delistedUtc: { type: "UTF8", optional: true },
+  lastUpdatedUtc: { type: "UTF8", optional: true },
+  identitySource: { type: "UTF8" }, identityConfidence: { type: "UTF8" }, referenceStatus: { type: "UTF8" },
+  source: { type: "UTF8" }, sourceVersion: { type: "UTF8" }, asOfDate: { type: "UTF8" }, ingestedAt: { type: "UTF8" },
+});
+
+export const SYMBOL_ALIASES_SCHEMA = new ParquetSchema({
+  instrumentId: { type: "UTF8" }, ticker: { type: "UTF8" },
+  tickerRoot: { type: "UTF8", optional: true }, tickerSuffix: { type: "UTF8", optional: true },
+  primaryExchange: { type: "UTF8", optional: true },
+  validFrom: { type: "UTF8" }, validTo: { type: "UTF8", optional: true },
+  source: { type: "UTF8" }, sourceVersion: { type: "UTF8" }, asOfDate: { type: "UTF8" },
+  confidence: { type: "UTF8" }, createdAt: { type: "UTF8" },
+});
+
+export function securitiesKey(asOfDate: string): string {
+  return `reference/securities/asOf=${asOfDate}/part.parquet`;
+}
+
+export function symbolAliasesKey(asOfDate: string): string {
+  return `reference/symbol_aliases/asOf=${asOfDate}/part.parquet`;
+}
+
+export async function writeSymbolAliases(s3: S3Client, bucket: string, asOfDate: string, rows: SymbolAliasRow[]): Promise<string> {
+  const key = symbolAliasesKey(asOfDate);
+  const flat = rows.map((r) => ({ ...r, validTo: r.validTo ?? undefined }));
+  const body = await toParquet(SYMBOL_ALIASES_SCHEMA, flat as unknown as Record<string, unknown>[]);
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
+  return key;
+}
+
+export async function writeSecurities(s3: S3Client, bucket: string, asOfDate: string, rows: SecurityMasterRow[]): Promise<string> {
+  const key = securitiesKey(asOfDate);
+  const body = await toParquet(SECURITIES_SCHEMA, rows as unknown as Record<string, unknown>[]);
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
+  return key;
+}
 
 export async function toParquet(schema: ParquetSchema, rows: Record<string, unknown>[]): Promise<Buffer> {
   const chunks: Buffer[] = [];

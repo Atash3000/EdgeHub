@@ -1,6 +1,7 @@
 import type { MarketDataProvider } from "./provider.js";
-import type { VendorBar, ProviderResult, ProviderFailure } from "../types.js";
+import type { VendorBar, ProviderResult, ProviderFailure, SecurityMasterRow, SecurityMasterResult } from "../types.js";
 import { SOURCE_VERSION } from "../types.js";
+import { makeInstrumentId, splitTicker } from "../identity.js";
 
 type FetchInit = { headers: Record<string, string> };
 type FetchFn = (url: string, init?: FetchInit) => Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }>;
@@ -9,6 +10,13 @@ interface Agg { t: number; o: number; h: number; l: number; c: number; v: number
 interface AggResponse { status?: string; results?: Agg[]; }
 interface GroupedResult extends Agg { T: string; }
 interface GroupedResponse { status?: string; results?: GroupedResult[]; }
+
+interface RefTicker {
+  ticker: string; name?: string; market?: string; locale?: string; type?: string;
+  currency_name?: string; cik?: string; composite_figi?: string; share_class_figi?: string;
+  primary_exchange?: string; active?: boolean; list_date?: string; delisted_utc?: string; last_updated_utc?: string;
+}
+interface RefResponse { status?: string; results?: RefTicker[]; }
 
 const BASE = "https://api.polygon.io";
 const isoDate = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
@@ -94,5 +102,37 @@ export class PolygonProvider implements MarketDataProvider {
     } catch (err) {
       return { bars: [], failures: tickers.map((t) => ({ ticker: t, date, reason: "provider_error", message: (err as Error).message })) };
     }
+  }
+
+  async listSecurities(asOfDate: string, tickers: string[] = []): Promise<SecurityMasterResult> {
+    const securities: SecurityMasterRow[] = [];
+    const failures: ProviderFailure[] = [];
+    const at = new Date().toISOString();
+    for (const ticker of tickers) {
+      const url = `${BASE}/v3/reference/tickers?ticker=${encodeURIComponent(ticker)}&date=${asOfDate}&limit=1`;
+      try {
+        const json = (await this.get(url)) as RefResponse;
+        ensureOk(json.status);
+        const r = (json.results ?? [])[0];
+        if (!r) { failures.push({ ticker, date: asOfDate, reason: "missing_reference_data" }); continue; }
+        const { tickerRoot, tickerSuffix } = splitTicker(r.ticker); // metadata only
+        const id = makeInstrumentId({
+          shareClassFigi: r.share_class_figi, compositeFigi: r.composite_figi,
+          cik: r.cik, ticker: r.ticker, primaryExchange: r.primary_exchange,
+        });
+        securities.push({
+          instrumentId: id.instrumentId, ticker: r.ticker, tickerRoot, tickerSuffix,
+          name: r.name, market: r.market, locale: r.locale, type: r.type, currencyName: r.currency_name,
+          cik: r.cik, compositeFigi: r.composite_figi, shareClassFigi: r.share_class_figi,
+          primaryExchange: r.primary_exchange, active: r.active ?? true,
+          listDate: r.list_date, delistedUtc: r.delisted_utc, lastUpdatedUtc: r.last_updated_utc,
+          identitySource: id.identitySource, identityConfidence: id.identityConfidence, referenceStatus: "FOUND",
+          source: this.name, sourceVersion: this.version, asOfDate, ingestedAt: at,
+        });
+      } catch (err) {
+        failures.push({ ticker, date: asOfDate, reason: "provider_error", message: (err as Error).message });
+      }
+    }
+    return { securities, failures };
   }
 }

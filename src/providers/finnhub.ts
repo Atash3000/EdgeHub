@@ -1,5 +1,5 @@
 import type { MarketDataProvider } from "./provider.js";
-import type { VendorBar, ProviderResult, ProviderFailure } from "../types.js";
+import type { VendorBar, ProviderResult, ProviderFailure, SecurityMasterResult } from "../types.js";
 import { SOURCE_VERSION } from "../types.js";
 
 interface FinnhubCandle { s: string; t?: number[]; o?: number[]; h?: number[]; l?: number[]; c?: number[]; v?: number[]; }
@@ -85,5 +85,11 @@ export class FinnhubProvider implements MarketDataProvider {
     } catch (err) {
       return { bars: [], failures: [{ ticker, date: endDate ?? "", reason: "provider_error", message: (err as Error).message }] };
     }
+  }
+
+  async listSecurities(asOfDate: string, tickers: string[] = []): Promise<SecurityMasterResult> {
+    // Finnhub free tier has no point-in-time reference master; report all as missing so the
+    // pipeline mints EH: fallbacks. (Finnhub is not the active provider.)
+    return { securities: [], failures: tickers.map((t) => ({ ticker: t, date: asOfDate, reason: "missing_reference_data" })) };
   }
 }

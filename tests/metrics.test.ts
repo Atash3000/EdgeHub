@@ -13,11 +13,21 @@ describe("sma", () => {
 describe("pctReturn", () => {
   it("computes trailing return", () => { expect(pctReturn([100, 110], 1)).toBeCloseTo(0.1); });
 });
+describe("computeMetrics instrumentId", () => {
+  it("stamps the passed instrumentId onto the row", () => {
+    const bars: VendorBar[] = [{ ticker: "AAPL", date: "2026-06-30", open: 1, high: 1, low: 1, close: 1, adjustedClose: null, isAdjusted: false, volume: 1, source: "x", sourceVersion: "1.0", ingestedAt: "x" }];
+    const p: Provenance = { runId: "R", ingestedAt: "x", source: "x", sourceVersion: "1.0", schemaVersion: "metrics_v2", metricVersion: "1.0", universeVersion: "2026-06-30" };
+    const row = computeMetrics(bars, p, { status: "OK", issues: [] }, "BBG_AAPL");
+    expect(row.instrumentId).toBe("BBG_AAPL");
+    expect(row.ticker).toBe("AAPL");
+  });
+});
+
 describe("computeMetrics", () => {
   it("computes ma20 and flags, injects quality", () => {
     const bars: VendorBar[] = [];
     for (let i = 0; i < 25; i++) bars.push(bar(`2026-05-${String(i + 1).padStart(2, "0")}`, 100 + i));
-    const row = computeMetrics(bars, prov, ok);
+    const row = computeMetrics(bars, prov, ok, "AAPL");
     expect(row.ticker).toBe("AAPL");
     expect(row.close).toBe(124);
     expect(row.ma20).toBeCloseTo(sma(bars.map((b) => b.close), 20)!);

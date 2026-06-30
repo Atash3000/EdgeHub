@@ -14,6 +14,11 @@ export function renderReport(m: RunManifest): string {
     `Rejected: ${m.rejected}`,
     `Missing bars: ${m.missingBars}`,
     `Metric Version: ${m.metricVersion}`,
+    `Securities mastered: ${m.securitiesMastered}`,
+    `Securities resolved: ${m.securitiesResolved}`,
+    `Missing reference (EH fallback): ${m.missingReferenceData}`,
+    `Unresolved tickers: ${m.unresolvedTickers}`,
+    `Alias rows: ${m.aliasRows}`,
     `Runtime: ${m.runtimeSec}s`,
     `Status: ${m.status}`,
   ];
