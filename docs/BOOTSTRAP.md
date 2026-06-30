@@ -40,11 +40,11 @@ Add the role ARN as GitHub repo **variable** `AWS_DEPLOY_ROLE_ARN` (Settings →
 
 The Finnhub key is already in SSM at `/edge-hunter/finnhub/api_key` (SecureString).
 
-Telegram is optional — to enable it, create the bot token at `/edge-hub/telegram/api-key` AND the chat id at `/edge-hub/telegram/chat_id` (both SecureString); if either is absent the daily report is written to CloudWatch Logs instead.
+Telegram is optional — to enable it, create the bot token at `/edge-hub/telegram/api-key` AND the chat id at `/edge-hub/telegram/chat-id` (both SecureString); if either is absent the daily report is written to CloudWatch Logs instead.
 
 ```bash
 aws ssm put-parameter --name /edge-hub/telegram/api-key --type SecureString --value "<BOT_TOKEN>"
-aws ssm put-parameter --name /edge-hub/telegram/chat_id --type SecureString --value "<CHAT_ID>"
+aws ssm put-parameter --name /edge-hub/telegram/chat-id --type SecureString --value "<CHAT_ID>"
 ```
 
 ## 3. First backfill (after first successful deploy)

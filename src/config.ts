@@ -6,7 +6,7 @@ export interface ParamNames { finnhubApiKey: string; telegramBotToken: string; t
 export const DEFAULT_PARAM_NAMES: ParamNames = {
   finnhubApiKey: "/edge-hunter/finnhub/api_key",
   telegramBotToken: "/edge-hub/telegram/api-key",
-  telegramChatId: "/edge-hub/telegram/chat_id",
+  telegramChatId: "/edge-hub/telegram/chat-id",
 };
 
 /** Pure selector — unit-testable without AWS. Requires the finnhub api key; telegram is optional. */

@@ -19,7 +19,7 @@ describe("selectConfig", () => {
       [
         { Name: "/edge-hunter/finnhub/api_key", Value: "abc" },
         { Name: "/edge-hub/telegram/api-key", Value: "bot" },
-        { Name: "/edge-hub/telegram/chat_id", Value: "123" },
+        { Name: "/edge-hub/telegram/chat-id", Value: "123" },
       ],
       DEFAULT_PARAM_NAMES
     );
