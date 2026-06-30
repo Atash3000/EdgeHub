@@ -129,6 +129,54 @@ describe("runPipeline (backfill, non-trading day resolves to previous trading da
   });
 });
 
+describe("runPipeline (daily, old-date replay does NOT truncate cache)", () => {
+  it("writes back the full merged history including bars newer than effectiveDate", async () => {
+    const makeBar = (ticker: string, date: string, close = 100): VendorBar => ({
+      ticker, date, open: close, high: close + 1, low: close - 1, close,
+      adjustedClose: null, isAdjusted: false, volume: 1000, source: "fake", sourceVersion: "1.0", ingestedAt: "x",
+    });
+    const replayDate = "2025-03-03";
+    const futureDate = "2025-06-01";
+    const allTickers = ["AAPL", "MSFT", "GOOG", "AMZN", "NVDA", "TSLA", "AVGO", "SPY", "QQQ"];
+    // All tickers have a bar for the replay date; only AAPL's stored cache carries a future bar.
+    const hist = new Map(allTickers.map((t) => [t, [makeBar(t, replayDate, 100)]]));
+
+    // Build AAPL stored cache with enough history (>=253 bars) so hasEnoughHistory passes and
+    // we stay on the stored-only path — proving the fix without the getHistory fallback masking it.
+    // Also includes a future bar dated 2025-06-01 that must survive the cache write.
+    const aaplStoredCache: VendorBar[] = [];
+    { let y = 2023, mo = 1, d = 1;
+      for (let i = 0; i < 252; i++) {
+        const date = `${y}-${String(mo).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+        aaplStoredCache.push(makeBar("AAPL", date, 100 + i));
+        d++; if (d > 28) { d = 1; mo++; } if (mo > 12) { mo = 1; y++; }
+      }
+    }
+    aaplStoredCache.push(makeBar("AAPL", futureDate, 200)); // future bar — must survive cache refresh
+
+    const cacheWrites = new Map<string, string[]>();
+    const s3 = { send: async () => ({}) } as never;
+    const glue = { send: async () => ({}) } as never;
+    const m = await runPipeline("daily", {
+      provider: new FakeProvider(hist), s3, glue, bucket: "b", database: "edgehub",
+      tradingDay: replayDate,
+      now: () => new Date("2025-03-03T22:30:00Z"),
+      readHistory: async (t) => (t === "AAPL" ? aaplStoredCache : []),
+      writeHistory: async (t, bars) => { cacheWrites.set(t, bars.map((b) => b.date)); },
+      isTradingDay: () => true,
+      previousTradingDay: (d) => d,
+      calendarCovers: () => true,
+    });
+    expect(m.status).toMatch(/^(SUCCESS|PARTIAL)$/);
+    // AAPL's cache write must include the future bar — cache must NOT be truncated at effectiveDate
+    const written = cacheWrites.get("AAPL");
+    expect(written).toBeDefined();
+    expect(written).toContain(futureDate);
+    // Metric partition is still the replay date, not the future date
+    expect(m.tradingDay).toBe(replayDate);
+  });
+});
+
 describe("runPipeline (daily, old-date replay ignores future cache bars)", () => {
   it("trims future cache bars so current bar resolves to the replay date, not a future date", async () => {
     const makeBar = (ticker: string, date: string, close = 100): VendorBar => ({

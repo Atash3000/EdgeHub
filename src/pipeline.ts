@@ -120,23 +120,25 @@ export async function runPipeline(mode: RunMode, deps: Deps): Promise<RunManifes
   for (const ticker of tickers) {
     try {
       let bars: VendorBar[];
+      let cacheBars: VendorBar[] | null = null; // full untruncated history to refresh the cache with (daily only)
       if (mode === "backfill") {
         const r = await deps.provider.getHistory(ticker, LOOKBACK_DAYS, effectiveDate);
         for (const f of r.failures) recordError(f.ticker || ticker, f.reason, f.message);
-        bars = r.bars.filter((b) => b.date <= effectiveDate);
+        bars = r.bars.filter((b) => b.date <= effectiveDate).sort((a, b) => a.date.localeCompare(b.date));
         if (bars.length === 0) { missingBars++; continue; }
         await deps.writeHistory(ticker, bars); // seed the cache (backfill's primary job) even if today's bar isn't out yet
       } else {
         const latest = latestByTicker.get(ticker);
         if (!latest) { missingBars++; continue; } // failure already recorded from the batch result
         const stored = await deps.readHistory(ticker);
-        bars = mergeHistory(stored, latest);
-        if (!hasEnoughHistory(bars, MIN_SESSIONS)) {
+        let fullBars = mergeHistory(stored, latest);
+        if (!hasEnoughHistory(fullBars, MIN_SESSIONS)) {
           const r = await deps.provider.getHistory(ticker, LOOKBACK_DAYS, effectiveDate);
           for (const f of r.failures) recordError(f.ticker || ticker, f.reason, f.message);
-          bars = mergeHistory(r.bars, latest);
+          fullBars = mergeHistory(r.bars, latest);
         }
-        bars = bars.filter((b) => b.date <= effectiveDate); // never let a future cached bar masquerade as the current session
+        cacheBars = fullBars; // refresh cache with the FULL history (never discard bars newer than effectiveDate on replay)
+        bars = fullBars.filter((b) => b.date <= effectiveDate); // computation/selection slice ends at effectiveDate
       }
 
       // Select the current session strictly by date — no array-position guessing, no stale/wrong-date row.
@@ -149,7 +151,7 @@ export async function runPipeline(mode: RunMode, deps: Deps): Promise<RunManifes
       if (grade.status === "WARN") { warnings++; recordError(ticker, "warn", grade.issues.join(",")); }
 
       metricRows.push(computeMetrics(bars, prov, grade)); // bars end at effectiveDate
-      if (mode === "daily") await deps.writeHistory(ticker, bars); // refresh cache for next run
+      if (mode === "daily" && cacheBars) await deps.writeHistory(ticker, cacheBars); // refresh cache (full history) for accepted bars only
     } catch (err) {
       recordError(ticker, "pipeline_error", (err as Error).message); // per-ticker failure is non-fatal
       continue;
