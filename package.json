@@ -1,0 +1,26 @@
+{
+  "name": "edgehub",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "build": "tsc -p tsconfig.json",
+    "invoke:local": "sam local invoke EdgeHubCollector -e events/daily.json"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/client-glue": "^3.600.0",
+    "@aws-sdk/client-secrets-manager": "^3.600.0",
+    "@dsnp/parquetjs": "^1.8.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0",
+    "esbuild": "^0.23.0"
+  }
+}
