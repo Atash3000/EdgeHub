@@ -1,9 +1,9 @@
 name: Deploy
-# Manual-only until the AWS bootstrap (OIDC deploy role + AWS_DEPLOY_ROLE_ARN variable) is verified.
-# To re-enable auto-deploy on merge to main, replace `workflow_dispatch:` with:
-#   push:
-#     branches: [main]
+# Auto-deploys to AWS on every merge to main via GitHub OIDC (no stored AWS keys).
+# workflow_dispatch is kept so you can also trigger a deploy manually from the Actions tab.
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
