@@ -25,7 +25,7 @@ export function pctReturn(closes: number[], lookback: number): number | null {
 function maxOver(v: number[], w: number): number | null { return v.length < w ? null : Math.max(...v.slice(-w)); }
 function minOver(v: number[], w: number): number | null { return v.length < w ? null : Math.min(...v.slice(-w)); }
 
-export function computeMetrics(bars: VendorBar[], prov: Provenance, quality: { status: QualityStatus; issues: string[] }): MetricRow {
+export function computeMetrics(bars: VendorBar[], prov: Provenance, quality: { status: QualityStatus; issues: string[] }, instrumentId: string): MetricRow {
   const last = bars[bars.length - 1]!;
   const closes = bars.map((b) => b.close);
   const highs = bars.map((b) => b.high);
@@ -38,7 +38,7 @@ export function computeMetrics(bars: VendorBar[], prov: Provenance, quality: { s
   const high52w = maxOver(highs, 252), low52w = minOver(lows, 252);
 
   return {
-    ticker: last.ticker, instrumentId: last.ticker, date: last.date, close: last.close,
+    ticker: last.ticker, instrumentId, date: last.date, close: last.close,
     dollarVolume: last.close * last.volume,
     ma20, ma50, ma150, ma200,
     avgVolume20: sma(volumes, 20), avgVolume50: sma(volumes, 50),

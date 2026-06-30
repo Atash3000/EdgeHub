@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { rawKey, metricsKey } from "../src/storage.js";
+import { rawKey, metricsKey, RAW_SCHEMA, METRIC_SCHEMA } from "../src/storage.js";
+
+describe("parquet schemas carry instrumentId", () => {
+  it("RAW_SCHEMA and METRIC_SCHEMA both define instrumentId", () => {
+    expect(RAW_SCHEMA.schema.instrumentId).toBeDefined();
+    expect(METRIC_SCHEMA.schema.instrumentId).toBeDefined();
+  });
+});
 
 describe("path builders", () => {
   it("builds a raw key with source + runId", () => {

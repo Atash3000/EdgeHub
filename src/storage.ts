@@ -17,6 +17,7 @@ export function metricsKey(date: string, runId: string): string {
 }
 
 export const RAW_SCHEMA = new ParquetSchema({
+  instrumentId: { type: "UTF8" },
   ticker: { type: "UTF8" }, date: { type: "UTF8" },
   open: { type: "DOUBLE" }, high: { type: "DOUBLE" }, low: { type: "DOUBLE" }, close: { type: "DOUBLE" },
   adjustedClose: { type: "DOUBLE", optional: true }, isAdjusted: { type: "BOOLEAN" },
@@ -26,6 +27,7 @@ export const RAW_SCHEMA = new ParquetSchema({
 });
 
 export const METRIC_SCHEMA = new ParquetSchema({
+  instrumentId: { type: "UTF8" },
   ticker: { type: "UTF8" }, date: { type: "UTF8" }, close: { type: "DOUBLE" }, dollarVolume: { type: "DOUBLE" },
   ma20: { type: "DOUBLE", optional: true }, ma50: { type: "DOUBLE", optional: true },
   ma150: { type: "DOUBLE", optional: true }, ma200: { type: "DOUBLE", optional: true },
