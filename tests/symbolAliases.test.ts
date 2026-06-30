@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { buildSymbolAliases, symbolAliasesKey } from "../src/symbolAliases.js";
+import { buildSymbolAliases, readAliasesState, symbolAliasesKey } from "../src/symbolAliases.js";
 import type { SecurityMasterRow, SymbolAliasRow } from "../src/types.js";
 
 const sec = (instrumentId: string, ticker: string): SecurityMasterRow => ({
@@ -36,5 +36,22 @@ describe("buildSymbolAliases", () => {
     expect(fb.validTo).toBe("2026-06-29");
     expect(meta).toMatchObject({ validFrom: "2026-06-30", validTo: null });
     expect(aliases).toHaveLength(2);
+  });
+
+  it("reports a conflict when two securities share the same instrumentId with different tickers", () => {
+    const { aliases, conflicts } = buildSymbolAliases(
+      [sec("ID1", "AAA"), sec("ID1", "BBB")], [], "2026-06-30", "2026-06-29", "polygon", "1.0", "t",
+    );
+    expect(conflicts).toContain("BBB");
+    const id1Aliases = aliases.filter((a) => a.instrumentId === "ID1");
+    expect(id1Aliases).toHaveLength(1);
+    expect(id1Aliases[0]).toMatchObject({ ticker: "AAA", validTo: null });
+  });
+});
+
+describe("readAliasesState", () => {
+  it("returns [] when the S3 object is missing", async () => {
+    const s3 = { send: async () => { throw Object.assign(new Error("nope"), { name: "NoSuchKey" }); } } as never;
+    expect(await readAliasesState(s3, "b")).toEqual([]);
   });
 });
