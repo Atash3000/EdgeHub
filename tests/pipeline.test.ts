@@ -54,6 +54,25 @@ describe("runPipeline (backfill, fake provider)", () => {
     expect(calls).toContain("PutObjectCommand");
     expect(written.size).toBe(9); // cache refreshed per ticker
   });
+
+  it("registers daily_bars partition even when all bars are REJECTED (zero metrics)", async () => {
+    const bar = (date: string, close: number): VendorBar => ({
+      ticker: "AAPL", date, open: close, high: close, low: close, close, adjustedClose: null,
+      isAdjusted: false, volume: 1000, source: "fake", sourceVersion: "1.0", ingestedAt: "x",
+    });
+    const hist = new Map([["AAPL", [bar("2025-01-02", 100), bar("2025-01-03", -5)]]]);
+    const glueCalls: string[] = [];
+    const s3 = { send: async () => ({}) } as never;
+    const glue = { send: async (c: unknown) => { glueCalls.push((c as { constructor: { name: string } }).constructor.name); return {}; } } as never;
+    const m = await runPipeline("backfill", {
+      provider: new FakeProvider(hist), s3, glue, bucket: "b", database: "edgehub", tradingDay: "2025-01-03",
+      now: () => new Date("2025-01-03T22:30:00Z"),
+      readHistory: async () => [], writeHistory: async () => {},
+      isTradingDay: () => true, calendarCovers: () => true,
+    });
+    expect(m.rowsWritten).toBe(0); // no metrics (the only bar was rejected)
+    expect(glueCalls).toContain("BatchCreatePartitionCommand"); // daily_bars partition STILL registered
+  });
 });
 
 describe("runPipeline (daily, non-trading day)", () => {

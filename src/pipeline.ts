@@ -148,10 +148,10 @@ export async function runPipeline(mode: RunMode, deps: Deps): Promise<RunManifes
 
   if (rawToStore.length > 0) {
     await writeRaw(deps.s3, deps.bucket, rawToStore, deps.provider.name, deps.tradingDay, runId);
+    await addPartition(deps.glue, deps.database, "daily_bars", deps.bucket, `raw/${deps.provider.name}/daily`, deps.tradingDay);
   }
   if (metricRows.length > 0) {
     await writeMetrics(deps.s3, deps.bucket, metricRows, deps.tradingDay, runId);
-    await addPartition(deps.glue, deps.database, "daily_bars", deps.bucket, `raw/${deps.provider.name}/daily`, deps.tradingDay);
     await addPartition(deps.glue, deps.database, "daily_metrics", deps.bucket, "metrics/daily", deps.tradingDay);
   }
   await writeErrors(deps.s3, deps.bucket, deps.tradingDay, runId, errors); // no-op if empty
