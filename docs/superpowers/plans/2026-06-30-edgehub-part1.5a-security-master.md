@@ -950,7 +950,9 @@ export function buildSymbolAliases(
   asOfDate: string, previousTradingDay: string, source: string, sourceVersion: string, createdAt: string,
 ): { aliases: SymbolAliasRow[]; conflicts: string[] } {
   const conflicts: string[] = [];
-  // Today's open ticker per instrumentId (one security per instrumentId expected).
+  // Today's open ticker per instrumentId. buildSecurityMaster guarantees unique tickers, so the only
+  // realizable collision is two tickers sharing one instrumentId (e.g. same FIGI): first wins, the
+  // second is recorded in `conflicts`. ("same ticker -> two instrumentIds" cannot occur here.)
   const currentTickerById = new Map<string, SecurityMasterRow>();
   for (const s of securities) {
     if (currentTickerById.has(s.instrumentId) && currentTickerById.get(s.instrumentId)!.ticker !== s.ticker) {
@@ -1520,7 +1522,7 @@ with:
   // forward symbol aliases
   const priorAliases = await readAliasesState(deps.s3, deps.bucket);
   const aliasBuild = buildSymbolAliases(securities, priorAliases, effectiveDate, deps.previousTradingDay(effectiveDate), deps.provider.name, deps.provider.version, ingestedAt);
-  for (const t of aliasBuild.conflicts) recordError(t, "alias_conflict", `Ticker ${t} maps to multiple instrumentIds on ${effectiveDate}`);
+  for (const t of aliasBuild.conflicts) recordError(t, "alias_conflict", `Ticker ${t} collides onto an instrumentId already claimed by another ticker on ${effectiveDate}`);
   await writeSymbolAliases(deps.s3, deps.bucket, effectiveDate, aliasBuild.aliases);
 
   // persist read-model state for tomorrow's carry-forward

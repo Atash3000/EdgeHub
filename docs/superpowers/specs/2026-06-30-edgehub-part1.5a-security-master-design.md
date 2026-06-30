@@ -330,8 +330,10 @@ No restamping.
   - **Forward rename** (an `instrumentId` whose open ticker today differs from its open prior ticker):
     close the prior (`validTo = previousTradingDay`) and open the new (`validFrom = asOfDate`).
   - De-dupe identical open rows; never write a duplicate open `(instrumentId, ticker)`.
-  - On an irreconcilable conflict (same ticker → two instrumentIds in one day), keep the
-    higher-confidence identity and log `alias_conflict`.
+  - On an irreconcilable conflict — an `instrumentId` claimed by two different universe tickers on
+    one day (e.g. two tickers sharing a FIGI). Note "same ticker → two instrumentIds" **cannot**
+    occur here, because `buildSecurityMaster` guarantees one row per ticker; the realizable collision
+    is the reverse. Keep the first mapping and log `alias_conflict` for the colliding ticker.
 - `writeSymbolAliases(s3, bucket, asOfDate, rows): Promise<string>` → Parquet via `SYMBOL_ALIASES_SCHEMA`.
 
 Each `asOf` snapshot holds the **full** current alias table (carried-forward + today's changes), so the
