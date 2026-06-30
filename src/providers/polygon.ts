@@ -13,6 +13,12 @@ interface GroupedResponse { status?: string; results?: GroupedResult[]; }
 const BASE = "https://api.polygon.io";
 const isoDate = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
+/** Polygon returns a `status` of "OK"/"DELAYED" for valid data; any other status (ERROR, NOT_AUTHORIZED, ...)
+ *  is a real failure even on HTTP 200 — surface it as a provider error rather than treating it as "no data". */
+function ensureOk(status: string | undefined): void {
+  if (status && status !== "OK" && status !== "DELAYED") throw new Error(`polygon status ${status}`);
+}
+
 export function mapAgg(ticker: string, r: Agg, ingestedAt: string): VendorBar {
   return {
     ticker, date: isoDate(r.t),
@@ -56,9 +62,10 @@ export class PolygonProvider implements MarketDataProvider {
     const end = endDate ?? new Date().toISOString().slice(0, 10);
     const fromMs = new Date(`${end}T00:00:00Z`).getTime() - Math.ceil(lookbackDays * 1.5) * 86400000;
     const from = new Date(fromMs).toISOString().slice(0, 10);
-    const url = `${BASE}/v2/aggs/ticker/${ticker}/range/1/day/${from}/${end}?adjusted=true&sort=asc&limit=50000`;
+    const url = `${BASE}/v2/aggs/ticker/${encodeURIComponent(ticker)}/range/1/day/${from}/${end}?adjusted=true&sort=asc&limit=50000`;
     try {
       const json = (await this.get(url)) as AggResponse;
+      ensureOk(json.status);
       const at = new Date().toISOString();
       const bars = (json.results ?? []).map((r) => mapAgg(ticker, r, at)).filter((b) => b.date <= end);
       return { bars, failures: [] };
@@ -71,6 +78,7 @@ export class PolygonProvider implements MarketDataProvider {
     const url = `${BASE}/v2/aggs/grouped/locale/us/market/stocks/${date}?adjusted=true`;
     try {
       const json = (await this.get(url)) as GroupedResponse;
+      ensureOk(json.status);
       const at = new Date().toISOString();
       const byTicker = new Map<string, GroupedResult>();
       for (const r of json.results ?? []) byTicker.set(r.T, r);
@@ -78,7 +86,8 @@ export class PolygonProvider implements MarketDataProvider {
       const failures: ProviderFailure[] = [];
       for (const t of tickers) {
         const r = byTicker.get(t);
-        if (r) bars.push(mapAgg(t, r, at));
+        // grouped-daily is date-specific; pin the bar to the requested date (honors the exact-date contract).
+        if (r) bars.push({ ...mapAgg(t, r, at), date });
         else failures.push({ ticker: t, date, reason: "missing_bar_for_date" });
       }
       return { bars, failures };

@@ -10,8 +10,8 @@ describe("selectConfig", () => {
     expect(result).toEqual({ finnhubToken: "abc" });
   });
 
-  it("throws when api key is missing", () => {
-    expect(() => selectConfig([], DEFAULT_PARAM_NAMES)).toThrow(/missing required SSM parameter/);
+  it("returns an empty config when no keys are present (the factory validates the active provider's key)", () => {
+    expect(selectConfig([], DEFAULT_PARAM_NAMES)).toEqual({});
   });
 
   it("includes telegram creds when both are present", () => {

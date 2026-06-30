@@ -5,7 +5,10 @@ import { PolygonProvider } from "./polygon.js";
 
 export function getProvider(name: string, secrets: Record<string, string>): MarketDataProvider {
   switch (name) {
-    case "finnhub": return new FinnhubProvider(secrets.finnhubToken ?? "");
+    case "finnhub": {
+      if (!secrets.finnhubToken) throw new Error("missing finnhub api key (/edge-hunter/finnhub/api_key)");
+      return new FinnhubProvider(secrets.finnhubToken);
+    }
     case "fake": return new FakeProvider(new Map());
     case "polygon": {
       if (!secrets.polygonToken) throw new Error("missing polygon api key (/global/polygon/api-key)");

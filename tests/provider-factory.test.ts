@@ -8,6 +8,10 @@ const bar = (date: string): VendorBar => ({ ticker: "AAPL", date, open: 1, high:
 describe("getProvider", () => {
   it("returns a fake provider", () => { expect(getProvider("fake", {}).name).toBe("fake"); });
   it("throws on unknown provider", () => { expect(() => getProvider("nope", {})).toThrow(/unknown data provider/i); });
+  it("returns a finnhub provider when its key is present", () => { expect(getProvider("finnhub", { finnhubToken: "k" }).name).toBe("finnhub"); });
+  it("throws when the active finnhub key is missing", () => { expect(() => getProvider("finnhub", {})).toThrow(/finnhub api key/i); });
+  it("returns a polygon provider when its key is present", () => { expect(getProvider("polygon", { polygonToken: "k" }).name).toBe("polygon"); });
+  it("throws when the active polygon key is missing", () => { expect(() => getProvider("polygon", {})).toThrow(/polygon api key/i); });
 });
 
 describe("FakeProvider.getLatestBars", () => {
