@@ -58,8 +58,29 @@ export const SECURITIES_SCHEMA = new ParquetSchema({
   source: { type: "UTF8" }, sourceVersion: { type: "UTF8" }, asOfDate: { type: "UTF8" }, ingestedAt: { type: "UTF8" },
 });
 
+export const SYMBOL_ALIASES_SCHEMA = new ParquetSchema({
+  instrumentId: { type: "UTF8" }, ticker: { type: "UTF8" },
+  tickerRoot: { type: "UTF8", optional: true }, tickerSuffix: { type: "UTF8", optional: true },
+  primaryExchange: { type: "UTF8", optional: true },
+  validFrom: { type: "UTF8" }, validTo: { type: "UTF8", optional: true },
+  source: { type: "UTF8" }, sourceVersion: { type: "UTF8" }, asOfDate: { type: "UTF8" },
+  confidence: { type: "UTF8" }, createdAt: { type: "UTF8" },
+});
+
 export function securitiesKey(asOfDate: string): string {
   return `reference/securities/asOf=${asOfDate}/part.parquet`;
+}
+
+export function symbolAliasesKey(asOfDate: string): string {
+  return `reference/symbol_aliases/asOf=${asOfDate}/part.parquet`;
+}
+
+export async function writeSymbolAliases(s3: S3Client, bucket: string, asOfDate: string, rows: SymbolAliasRow[]): Promise<string> {
+  const key = symbolAliasesKey(asOfDate);
+  const flat = rows.map((r) => ({ ...r, validTo: r.validTo ?? undefined }));
+  const body = await toParquet(SYMBOL_ALIASES_SCHEMA, flat as unknown as Record<string, unknown>[]);
+  await s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body }));
+  return key;
 }
 
 export async function writeSecurities(s3: S3Client, bucket: string, asOfDate: string, rows: SecurityMasterRow[]): Promise<string> {
