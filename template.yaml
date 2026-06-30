@@ -1,0 +1,179 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: EdgeHub Part 1 - Market Data Lake
+
+Globals:
+  Function:
+    Timeout: 900
+    MemorySize: 1024
+    Runtime: nodejs20.x
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "edgehub-data-${AWS::AccountId}-${AWS::Region}"  # globally-unique
+      VersioningConfiguration: { Status: Enabled }
+
+  EdgeHubSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: edgehub/secrets
+      Description: "Finnhub + Telegram credentials (value set manually once)"
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput: { Name: edgehub }
+
+  EdgeHubCollector:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: edgehub-daily-collector
+      Handler: src/handler.handler
+      ReservedConcurrentExecutions: 1   # one run at a time — prevents history-cache write races
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref DataBucket
+          GLUE_DATABASE: edgehub
+          DATA_PROVIDER: finnhub
+          SECRET_NAME: edgehub/secrets
+          SCHEMA_VERSION: metrics_v1
+          METRIC_VERSION: "1.0"
+          SOURCE_VERSION: "1.0"
+      Policies:
+        - S3CrudPolicy: { BucketName: !Ref DataBucket }
+        - Statement:
+            - Effect: Allow
+              Action: [glue:BatchCreatePartition, glue:GetPartition, glue:GetTable]
+              Resource: "*"
+            - Effect: Allow
+              Action: secretsmanager:GetSecretValue
+              Resource: !Ref EdgeHubSecret
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Format: esm
+        Target: node20
+        EntryPoints: [src/handler.ts]
+
+  SchedulerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: scheduler.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeCollector
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !GetAtt EdgeHubCollector.Arn
+
+  CollectorSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: edgehub-daily-630pm-et
+      # 6:30 PM ET per project-plan.md. If the vendor lags, missing bars are recorded and `current`
+      # is NOT advanced, so a too-early run is safe; bump to cron(30 19 ...) for 7:30 PM if lag recurs.
+      ScheduleExpression: cron(30 18 ? * MON-FRI *)
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow: { Mode: "OFF" }
+      Target:
+        Arn: !GetAtt EdgeHubCollector.Arn
+        RoleArn: !GetAtt SchedulerRole.Arn
+        Input: '{"mode":"daily"}'
+
+  DailyBarsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: daily_bars
+        TableType: EXTERNAL_TABLE
+        PartitionKeys: [{ Name: year, Type: string }, { Name: month, Type: string }, { Name: day, Type: string }]
+        Parameters: { classification: parquet }
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/raw/finnhub/daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
+          Columns:
+            - { Name: ticker, Type: string }
+            - { Name: date, Type: string }
+            - { Name: open, Type: double }
+            - { Name: high, Type: double }
+            - { Name: low, Type: double }
+            - { Name: close, Type: double }
+            - { Name: adjustedClose, Type: double }
+            - { Name: isAdjusted, Type: boolean }
+            - { Name: volume, Type: double }
+            - { Name: source, Type: string }
+            - { Name: sourceVersion, Type: string }
+            - { Name: ingestedAt, Type: string }
+            - { Name: runId, Type: string }
+            - { Name: schemaVersion, Type: string }
+            - { Name: metricVersion, Type: string }
+            - { Name: universeVersion, Type: string }
+
+  DailyMetricsTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: daily_metrics
+        TableType: EXTERNAL_TABLE
+        PartitionKeys: [{ Name: year, Type: string }, { Name: month, Type: string }, { Name: day, Type: string }]
+        Parameters: { classification: parquet }
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/metrics/daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
+          Columns:
+            - { Name: ticker, Type: string }
+            - { Name: date, Type: string }
+            - { Name: close, Type: double }
+            - { Name: dollarVolume, Type: double }
+            - { Name: ma20, Type: double }
+            - { Name: ma50, Type: double }
+            - { Name: ma150, Type: double }
+            - { Name: ma200, Type: double }
+            - { Name: avgVolume20, Type: double }
+            - { Name: avgVolume50, Type: double }
+            - { Name: atr14, Type: double }
+            - { Name: high52w, Type: double }
+            - { Name: low52w, Type: double }
+            - { Name: distanceTo52wHighPct, Type: double }
+            - { Name: distanceFrom52wLowPct, Type: double }
+            - { Name: return21d, Type: double }
+            - { Name: return63d, Type: double }
+            - { Name: return126d, Type: double }
+            - { Name: return252d, Type: double }
+            - { Name: above20ma, Type: boolean }
+            - { Name: above50ma, Type: boolean }
+            - { Name: above150ma, Type: boolean }
+            - { Name: above200ma, Type: boolean }
+            - { Name: ma150Above200, Type: boolean }
+            - { Name: ma200Rising, Type: boolean }
+            - { Name: qualityStatus, Type: string }
+            - { Name: qualityIssues, Type: string }
+            - { Name: runId, Type: string }
+            - { Name: ingestedAt, Type: string }
+            - { Name: source, Type: string }
+            - { Name: sourceVersion, Type: string }
+            - { Name: schemaVersion, Type: string }
+            - { Name: metricVersion, Type: string }
+            - { Name: universeVersion, Type: string }
+
+Outputs:
+  CollectorArn:
+    Value: !GetAtt EdgeHubCollector.Arn
