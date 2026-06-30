@@ -105,6 +105,7 @@ Resources:
           OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
           SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
           Columns:
+            - { Name: instrumentId, Type: string }
             - { Name: ticker, Type: string }
             - { Name: date, Type: string }
             - { Name: open, Type: double }
@@ -138,6 +139,7 @@ Resources:
           OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
           SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
           Columns:
+            - { Name: instrumentId, Type: string }
             - { Name: ticker, Type: string }
             - { Name: date, Type: string }
             - { Name: close, Type: double }
@@ -172,6 +174,76 @@ Resources:
             - { Name: schemaVersion, Type: string }
             - { Name: metricVersion, Type: string }
             - { Name: universeVersion, Type: string }
+
+  SecuritiesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: securities
+        TableType: EXTERNAL_TABLE
+        PartitionKeys: [{ Name: asOf, Type: string }]
+        Parameters: { classification: parquet }
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/reference/securities/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
+          Columns:
+            - { Name: instrumentId, Type: string }
+            - { Name: ticker, Type: string }
+            - { Name: tickerRoot, Type: string }
+            - { Name: tickerSuffix, Type: string }
+            - { Name: name, Type: string }
+            - { Name: market, Type: string }
+            - { Name: locale, Type: string }
+            - { Name: type, Type: string }
+            - { Name: currencyName, Type: string }
+            - { Name: cik, Type: string }
+            - { Name: compositeFigi, Type: string }
+            - { Name: shareClassFigi, Type: string }
+            - { Name: primaryExchange, Type: string }
+            - { Name: active, Type: boolean }
+            - { Name: listDate, Type: string }
+            - { Name: delistedUtc, Type: string }
+            - { Name: lastUpdatedUtc, Type: string }
+            - { Name: identitySource, Type: string }
+            - { Name: identityConfidence, Type: string }
+            - { Name: referenceStatus, Type: string }
+            - { Name: source, Type: string }
+            - { Name: sourceVersion, Type: string }
+            - { Name: asOfDate, Type: string }
+            - { Name: ingestedAt, Type: string }
+
+  SymbolAliasesTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: symbol_aliases
+        TableType: EXTERNAL_TABLE
+        PartitionKeys: [{ Name: asOf, Type: string }]
+        Parameters: { classification: parquet }
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/reference/symbol_aliases/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
+          Columns:
+            - { Name: instrumentId, Type: string }
+            - { Name: ticker, Type: string }
+            - { Name: tickerRoot, Type: string }
+            - { Name: tickerSuffix, Type: string }
+            - { Name: primaryExchange, Type: string }
+            - { Name: validFrom, Type: string }
+            - { Name: validTo, Type: string }
+            - { Name: source, Type: string }
+            - { Name: sourceVersion, Type: string }
+            - { Name: asOfDate, Type: string }
+            - { Name: confidence, Type: string }
+            - { Name: createdAt, Type: string }
 
 Outputs:
   CollectorArn:

@@ -23,3 +23,18 @@ export async function addPartition(glue: GlueClient, database: string, table: st
     throw err;
   }
 }
+
+export async function addAsOfPartition(glue: GlueClient, database: string, table: string, bucket: string, prefix: string, asOf: string): Promise<void> {
+  const location = `s3://${bucket}/${prefix}/asOf=${asOf}/`;
+  const tbl = await glue.send(new GetTableCommand({ DatabaseName: database, Name: table }));
+  const storageDescriptor = { ...(tbl.Table?.StorageDescriptor ?? {}), Location: location };
+  try {
+    await glue.send(new BatchCreatePartitionCommand({
+      DatabaseName: database, TableName: table,
+      PartitionInputList: [{ Values: [asOf], StorageDescriptor: storageDescriptor }],
+    }));
+  } catch (err) {
+    if (((err as { name?: string }).name ?? "").includes("AlreadyExists")) return;
+    throw err;
+  }
+}

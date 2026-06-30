@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { partitionValues, addPartition } from "../src/glue.js";
+import { partitionValues, addPartition, addAsOfPartition } from "../src/glue.js";
 import { GetTableCommand, BatchCreatePartitionCommand } from "@aws-sdk/client-glue";
 import type { GlueClient } from "@aws-sdk/client-glue";
 
@@ -74,5 +74,21 @@ describe("addPartition", () => {
       },
     };
     await expect(addPartition(client as unknown as GlueClient, "db", "t", "b", "p", "2026-06-29")).rejects.toMatchObject({ name: "InternalServiceException" });
+  });
+});
+
+describe("addAsOfPartition", () => {
+  it("registers a single asOf partition with the asOf location", async () => {
+    let created: { Values: string[]; StorageDescriptor: { Location: string } } | undefined;
+    const glue = {
+      send: async (c: any) => {
+        if (c.constructor.name === "GetTableCommand") return { Table: { StorageDescriptor: { Columns: [], SerdeInfo: {} } } };
+        if (c.constructor.name === "BatchCreatePartitionCommand") created = c.input.PartitionInputList[0];
+        return {};
+      },
+    } as never;
+    await addAsOfPartition(glue, "edgehub", "securities", "bkt", "reference/securities", "2026-06-30");
+    expect(created!.Values).toEqual(["2026-06-30"]);
+    expect(created!.StorageDescriptor.Location).toBe("s3://bkt/reference/securities/asOf=2026-06-30/");
   });
 });
