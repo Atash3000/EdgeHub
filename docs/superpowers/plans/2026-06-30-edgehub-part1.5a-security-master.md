@@ -16,8 +16,8 @@
 - **D3 — pure deterministic `makeInstrumentId`:** no cross-day pinning; add `identitySource`/`identityConfidence`; `identity_changed` is a non-blocking warning; no restamping.
 - **D4 — in-place schema bump:** add `instrumentId` to the existing `daily_bars`/`daily_metrics` tables and Parquet schemas; bump `dailyBars_v1→v2`, `metrics_v1→v2`; no parallel `*_v2` tables.
 - Provider method signature is future-ready: `listSecurities(asOfDate: string, tickers?: string[])`; 1.5a always passes `tickers`.
-- `identitySource→identityConfidence`: `SHARE_CLASS_FIGI`/`COMPOSITE_FIGI`→`HIGH`; `EH_CIK_TICKERROOT`→`MEDIUM`; `EH_TICKERROOT_EXCHANGE`/`EH_TICKER`→`LOW`.
-- `instrumentId` fallback chain: `share_class_figi → composite_figi → EH:<cik>:<tickerRoot> → EH:<tickerRoot>:<primaryExchange> → EH:<ticker>`.
+- `identitySource→identityConfidence`: `SHARE_CLASS_FIGI`/`COMPOSITE_FIGI`→`HIGH`; `EH_CIK_TICKER`→`MEDIUM`; `EH_TICKER_EXCHANGE`/`EH_TICKER`→`LOW`.
+- `instrumentId` fallback chain: `share_class_figi → composite_figi → EH:<cik>:<ticker> → EH:<ticker>:<primaryExchange> → EH:<ticker>`. **The `EH:` fallbacks use the full `ticker` (e.g. `BRK.A`), never `tickerRoot` — otherwise share classes (`BRK.A`/`BRK.B`) collide when FIGI is absent.** `tickerRoot`/`tickerSuffix` are descriptive metadata only, never identity keys.
 - TDD throughout: write the failing test first, watch it fail, implement minimally, watch it pass, commit. After **every** task `npm run typecheck` and `npm test` must both pass.
 - Commit messages end with: `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`.
 - Branch: `part-1.5a-security-master` (already checked out).
@@ -107,7 +107,7 @@ Add these exported types (place them after the `Provenance` interface):
 ```typescript
 export type IdentitySource =
   | "SHARE_CLASS_FIGI" | "COMPOSITE_FIGI"
-  | "EH_CIK_TICKERROOT" | "EH_TICKERROOT_EXCHANGE" | "EH_TICKER";
+  | "EH_CIK_TICKER" | "EH_TICKER_EXCHANGE" | "EH_TICKER";
 export type IdentityConfidence = "HIGH" | "MEDIUM" | "LOW";
 export type ReferenceStatus = "FOUND" | "MISSING_FALLBACK";
 
@@ -299,7 +299,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 - Consumes: `IdentitySource`, `IdentityConfidence` from `../src/types.js`.
 - Produces:
   - `splitTicker(ticker: string): { tickerRoot: string; tickerSuffix?: string }`
-  - `makeInstrumentId(input: { shareClassFigi?: string; compositeFigi?: string; cik?: string; tickerRoot?: string; ticker?: string; primaryExchange?: string }): { instrumentId: string; identitySource: IdentitySource; identityConfidence: IdentityConfidence }`
+  - `makeInstrumentId(input: { shareClassFigi?: string; compositeFigi?: string; cik?: string; ticker?: string; primaryExchange?: string }): { instrumentId: string; identitySource: IdentitySource; identityConfidence: IdentityConfidence }` — note: no `tickerRoot` param; the `EH:` fallbacks use the full `ticker`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -320,20 +320,20 @@ describe("splitTicker", () => {
 
 describe("makeInstrumentId", () => {
   it("prefers share_class_figi (HIGH)", () => {
-    const r = makeInstrumentId({ shareClassFigi: "BBG001S5N8V8", compositeFigi: "BBG000B9XRY4", cik: "0000320193", tickerRoot: "AAPL", ticker: "AAPL" });
+    const r = makeInstrumentId({ shareClassFigi: "BBG001S5N8V8", compositeFigi: "BBG000B9XRY4", cik: "0000320193", ticker: "AAPL" });
     expect(r).toEqual({ instrumentId: "BBG001S5N8V8", identitySource: "SHARE_CLASS_FIGI", identityConfidence: "HIGH" });
   });
   it("falls back to composite_figi (HIGH)", () => {
-    const r = makeInstrumentId({ compositeFigi: "BBG000B9XRY4", cik: "0000320193", tickerRoot: "AAPL", ticker: "AAPL" });
+    const r = makeInstrumentId({ compositeFigi: "BBG000B9XRY4", cik: "0000320193", ticker: "AAPL" });
     expect(r).toEqual({ instrumentId: "BBG000B9XRY4", identitySource: "COMPOSITE_FIGI", identityConfidence: "HIGH" });
   });
-  it("falls back to EH:cik:tickerRoot (MEDIUM)", () => {
-    const r = makeInstrumentId({ cik: "0000320193", tickerRoot: "AAPL", ticker: "AAPL" });
-    expect(r).toEqual({ instrumentId: "EH:0000320193:AAPL", identitySource: "EH_CIK_TICKERROOT", identityConfidence: "MEDIUM" });
+  it("falls back to EH:cik:ticker (MEDIUM)", () => {
+    const r = makeInstrumentId({ cik: "0000320193", ticker: "AAPL" });
+    expect(r).toEqual({ instrumentId: "EH:0000320193:AAPL", identitySource: "EH_CIK_TICKER", identityConfidence: "MEDIUM" });
   });
-  it("falls back to EH:tickerRoot:exchange (LOW)", () => {
-    const r = makeInstrumentId({ tickerRoot: "AAPL", primaryExchange: "XNAS", ticker: "AAPL" });
-    expect(r).toEqual({ instrumentId: "EH:AAPL:XNAS", identitySource: "EH_TICKERROOT_EXCHANGE", identityConfidence: "LOW" });
+  it("falls back to EH:ticker:exchange (LOW)", () => {
+    const r = makeInstrumentId({ ticker: "AAPL", primaryExchange: "XNAS" });
+    expect(r).toEqual({ instrumentId: "EH:AAPL:XNAS", identitySource: "EH_TICKER_EXCHANGE", identityConfidence: "LOW" });
   });
   it("falls back to EH:ticker (LOW) when nothing else is present", () => {
     const r = makeInstrumentId({ ticker: "AAPL" });
@@ -344,14 +344,15 @@ describe("makeInstrumentId", () => {
     const googl = makeInstrumentId({ shareClassFigi: "BBG009S3NB30", ticker: "GOOGL" });
     expect(goog.instrumentId).not.toBe(googl.instrumentId);
   });
-  it("gives BRK.A and BRK.B different EH ids when figi is absent", () => {
-    const a = makeInstrumentId({ tickerRoot: splitTicker("BRK.A").tickerRoot, primaryExchange: "XNYS", ticker: "BRK.A" });
-    const b = makeInstrumentId({ tickerRoot: splitTicker("BRK.B").tickerRoot, primaryExchange: "XNYS", ticker: "BRK.B" });
-    // roots collide, so distinctness here comes from the final ticker fallback being unnecessary;
-    // assert the EH:root:exchange ids are equal for roots but the bare-ticker fallback differs:
-    expect(makeInstrumentId({ ticker: "BRK.A" }).instrumentId).toBe("EH:BRK.A");
-    expect(makeInstrumentId({ ticker: "BRK.B" }).instrumentId).toBe("EH:BRK.B");
-    expect(a.instrumentId).toBe(b.instrumentId); // documents the known root-collision limitation (real BRK has distinct figis)
+  it("gives BRK.A and BRK.B different EH ids when figi is absent (full ticker, not root)", () => {
+    const a = makeInstrumentId({ cik: "0001067983", ticker: "BRK.A" });
+    const b = makeInstrumentId({ cik: "0001067983", ticker: "BRK.B" });
+    expect(a.instrumentId).toBe("EH:0001067983:BRK.A");
+    expect(b.instrumentId).toBe("EH:0001067983:BRK.B");
+    expect(a.instrumentId).not.toBe(b.instrumentId);
+    // and via the exchange fallback when cik is also absent:
+    expect(makeInstrumentId({ ticker: "BRK.A", primaryExchange: "XNYS" }).instrumentId).toBe("EH:BRK.A:XNYS");
+    expect(makeInstrumentId({ ticker: "BRK.B", primaryExchange: "XNYS" }).instrumentId).toBe("EH:BRK.B:XNYS");
   });
 });
 ```
@@ -376,12 +377,13 @@ export function splitTicker(ticker: string): { tickerRoot: string; tickerSuffix?
 /** Pure, deterministic identity. Fallback order is fixed (spec §6). No cross-day pinning. */
 export function makeInstrumentId(input: {
   shareClassFigi?: string; compositeFigi?: string;
-  cik?: string; tickerRoot?: string; ticker?: string; primaryExchange?: string;
+  cik?: string; ticker?: string; primaryExchange?: string;
 }): { instrumentId: string; identitySource: IdentitySource; identityConfidence: IdentityConfidence } {
   if (input.shareClassFigi) return { instrumentId: input.shareClassFigi, identitySource: "SHARE_CLASS_FIGI", identityConfidence: "HIGH" };
   if (input.compositeFigi) return { instrumentId: input.compositeFigi, identitySource: "COMPOSITE_FIGI", identityConfidence: "HIGH" };
-  if (input.cik && input.tickerRoot) return { instrumentId: `EH:${input.cik}:${input.tickerRoot}`, identitySource: "EH_CIK_TICKERROOT", identityConfidence: "MEDIUM" };
-  if (input.tickerRoot && input.primaryExchange) return { instrumentId: `EH:${input.tickerRoot}:${input.primaryExchange}`, identitySource: "EH_TICKERROOT_EXCHANGE", identityConfidence: "LOW" };
+  // EH: fallbacks use the FULL ticker (e.g. "BRK.A"), never tickerRoot — share classes must not collide.
+  if (input.cik && input.ticker) return { instrumentId: `EH:${input.cik}:${input.ticker}`, identitySource: "EH_CIK_TICKER", identityConfidence: "MEDIUM" };
+  if (input.ticker && input.primaryExchange) return { instrumentId: `EH:${input.ticker}:${input.primaryExchange}`, identitySource: "EH_TICKER_EXCHANGE", identityConfidence: "LOW" };
   return { instrumentId: `EH:${input.ticker ?? ""}`, identitySource: "EH_TICKER", identityConfidence: "LOW" };
 }
 ```
@@ -512,10 +514,10 @@ Add the method to the `PolygonProvider` class:
         ensureOk(json.status);
         const r = (json.results ?? [])[0];
         if (!r) { failures.push({ ticker, date: asOfDate, reason: "missing_reference_data" }); continue; }
-        const { tickerRoot, tickerSuffix } = splitTicker(r.ticker);
+        const { tickerRoot, tickerSuffix } = splitTicker(r.ticker); // metadata only
         const id = makeInstrumentId({
           shareClassFigi: r.share_class_figi, compositeFigi: r.composite_figi,
-          cik: r.cik, tickerRoot, ticker: r.ticker, primaryExchange: r.primary_exchange,
+          cik: r.cik, ticker: r.ticker, primaryExchange: r.primary_exchange,
         });
         securities.push({
           instrumentId: id.instrumentId, ticker: r.ticker, tickerRoot, tickerSuffix,
@@ -1809,4 +1811,4 @@ New `asOf` / `year-month-day` partitions may need `MSCK REPAIR TABLE` or are reg
 
 **Type consistency:** `makeInstrumentId` returns `{ instrumentId, identitySource, identityConfidence }` (Tasks 2, 3, 4 agree). `buildSecurityMaster` returns `{ securities, missingTickers, duplicateTickers, emptyMaster }` (Tasks 4, 9 agree). `buildSymbolAliases` returns `{ aliases, conflicts }` (Tasks 5, 9 agree). `resolveBarsToInstruments` returns `{ resolved, errors }` (Tasks 6, 9 agree). `computeMetrics(bars, prov, quality, instrumentId)` (Tasks 1 temp, 9 final agree). `enrichRaw(ResolvedVendorBar, ctx)` (Tasks 1 temp, 9 final agree). `historyCacheKey(source, instrumentId)` (Task 7) used as `readHistory(instrumentId)`/`writeHistory(instrumentId, bars)` in Task 9. ✓
 
-**Known intentional limitation documented:** Task 2's BRK.A/BRK.B test asserts that *without* FIGI the `EH:root:exchange` ids collide (real BRK has distinct FIGIs, so this never bites in practice) — matches spec §6's note that share-class distinctness comes from FIGI.
+**Share-class safety (Fix applied):** the `EH:` fallbacks use the full `ticker`, not `tickerRoot`, so `BRK.A`/`BRK.B` (and `GOOG`/`GOOGL`) get distinct ids even when FIGI is absent. `tickerRoot`/`tickerSuffix` remain only as descriptive metadata columns. Task 2's tests assert this distinctness via both the `EH:<cik>:<ticker>` and `EH:<ticker>:<exchange>` fallbacks.

@@ -108,7 +108,7 @@ export const SOURCE_VERSION = "1.0";              // unchanged
 ```ts
 export type IdentitySource =
   | "SHARE_CLASS_FIGI" | "COMPOSITE_FIGI"
-  | "EH_CIK_TICKERROOT" | "EH_TICKERROOT_EXCHANGE" | "EH_TICKER";
+  | "EH_CIK_TICKER" | "EH_TICKER_EXCHANGE" | "EH_TICKER";
 export type IdentityConfidence = "HIGH" | "MEDIUM" | "LOW";
 export type ReferenceStatus = "FOUND" | "MISSING_FALLBACK";
 
@@ -211,28 +211,29 @@ aliasRows: number;            // rows in the alias snapshot
 ```ts
 export function makeInstrumentId(input: {
   shareClassFigi?: string; compositeFigi?: string;
-  cik?: string; tickerRoot?: string; ticker?: string; primaryExchange?: string;
+  cik?: string; ticker?: string; primaryExchange?: string;
 }): { instrumentId: string; identitySource: IdentitySource; identityConfidence: IdentityConfidence };
 
 export function splitTicker(ticker: string): { tickerRoot: string; tickerSuffix?: string };
 ```
 
-**Fallback chain (in order):**
+**Fallback chain (in order):** the `EH:` fallbacks use the **full `ticker`** (e.g. `BRK.A`), never
+`tickerRoot` — otherwise share classes (`BRK.A`/`BRK.B`) collide when FIGI is absent.
 
 | Condition | `instrumentId` | `identitySource` | `identityConfidence` |
 |-----------|----------------|------------------|----------------------|
 | `shareClassFigi` present | `shareClassFigi` | `SHARE_CLASS_FIGI` | `HIGH` |
 | else `compositeFigi` present | `compositeFigi` | `COMPOSITE_FIGI` | `HIGH` |
-| else `cik` && `tickerRoot` | `EH:<cik>:<tickerRoot>` | `EH_CIK_TICKERROOT` | `MEDIUM` |
-| else `tickerRoot` && `primaryExchange` | `EH:<tickerRoot>:<primaryExchange>` | `EH_TICKERROOT_EXCHANGE` | `LOW` |
+| else `cik` && `ticker` | `EH:<cik>:<ticker>` | `EH_CIK_TICKER` | `MEDIUM` |
+| else `ticker` && `primaryExchange` | `EH:<ticker>:<primaryExchange>` | `EH_TICKER_EXCHANGE` | `LOW` |
 | else | `EH:<ticker>` | `EH_TICKER` | `LOW` |
 
-`splitTicker` handles share-class suffixes: `BRK.A → {root: "BRK", suffix: "A"}` (split on `.`). Used
-so `BRK.A`/`BRK.B` produce distinct `EH:` ids when FIGI is absent, and to populate `tickerRoot`/
-`tickerSuffix` on master/alias rows.
+`splitTicker` handles share-class suffixes: `BRK.A → {root: "BRK", suffix: "A"}` (split on `.`). It is
+used **only** to populate the descriptive `tickerRoot`/`tickerSuffix` columns on master/alias rows —
+**not** as an identity key. Share-class distinctness in the `EH:` fallbacks comes from the full ticker.
 
 **Tests (`identity.test.ts`):** the spec's five cases — share_class wins; composite second;
-`cik+tickerRoot` fallback; `tickerRoot+exchange` fallback; bare-ticker final fallback; plus
+`cik+ticker` fallback; `ticker+exchange` fallback; bare-ticker final fallback; plus
 `GOOG`/`GOOGL` and `BRK.A`/`BRK.B` distinctness when share-class FIGIs differ; plus confidence-mapping
 assertions.
 
