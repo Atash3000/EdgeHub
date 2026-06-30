@@ -18,7 +18,7 @@ and is treated as fixed. This document specifies **how it is built and deployed*
 |------|----------|
 | IaC / deploy framework | **AWS SAM** (`template.yaml` + `samconfig.toml`) |
 | Compute shape | **Option A** — single Lambda monolith, internally modular |
-| Language / runtime | **TypeScript** on **Node.js 20** Lambda |
+| Language / runtime | **TypeScript** on **Node.js 24** Lambda (`nodejs24.x`, latest stable LTS) |
 | Market data vendor | **Finnhub** as the first impl; active vendor chosen by config (`DATA_PROVIDER` env var), swappable behind a `MarketDataProvider` interface — nothing vendor-specific is hardcoded |
 | GitHub → AWS auth | **OIDC** (no long-lived keys), deploys only from `main` |
 | AWS region | **us-east-1** |
@@ -180,7 +180,7 @@ depends on, which version produced it, and which schema validated it.
   `raw/  metrics/  labels/  corporate_actions/  metadata/  reports/  errors/`
   (`labels/` and `corporate_actions/` are **reserved for Part 2 — created but unused in Part 1**, so
   later first-class data has a home without a migration).
-- **Lambda** `edgehub-daily-collector` — Node.js 20, **timeout 900s**, memory ~1024 MB,
+- **Lambda** `edgehub-daily-collector` — Node.js 24, **timeout 900s**, memory ~1024 MB,
   **`ReservedConcurrentExecutions: 1`** (one run at a time — prevents overlapping runs racing on the
   per-ticker history cache).
   Env vars: bucket name, region, `DATA_PROVIDER` (e.g. `finnhub`), `SCHEMA_VERSION`, `METRIC_VERSION`,

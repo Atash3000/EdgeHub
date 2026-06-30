@@ -6,11 +6,11 @@
 
 **Architecture:** A single, internally-modular TypeScript Lambda (`edgehub-daily-collector`) runs the pipeline (calendar check → universe → download → validate → store raw → compute metrics → store metrics → Glue partition → manifest → Telegram). EventBridge Scheduler triggers it daily at 6:30 PM America/New_York. Infrastructure is AWS SAM, deployed via GitHub Actions using OIDC. The vendor sits behind a `MarketDataProvider` interface returning `VendorBar`s; the pipeline enriches them with provenance into `RawBarRow`s.
 
-**Tech Stack:** TypeScript, Node.js 20, AWS SAM, AWS SDK v3 (S3/Glue/Secrets Manager), `@dsnp/parquetjs`, Vitest, GitHub Actions.
+**Tech Stack:** TypeScript, Node.js 24 (latest LTS), AWS SAM, AWS SDK v3 (S3/Glue/Secrets Manager), `@dsnp/parquetjs`, Vitest, GitHub Actions.
 
 ## Global Constraints
 
-- Runtime: **Node.js 20**, TypeScript bundled by SAM esbuild.
+- Runtime: **Node.js 24** (latest stable LTS; Lambda `nodejs24.x`), TypeScript bundled by SAM esbuild.
 - Region: **us-east-1**. Stack: **edgehub**. Bucket: **edgehub-data**.
 - Derived data is **metrics** (never "features"): dir `metrics/`, table `daily_metrics`, field `metricVersion`, env `METRIC_VERSION`.
 - Version constants: `SCHEMA_VERSION = "metrics_v1"`, `RAW_SCHEMA_VERSION = "dailyBars_v1"`, `METRIC_VERSION = "1.0"`, `SOURCE_VERSION = "1.0"`.
@@ -72,7 +72,7 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=20" },
+  "engines": { "node": ">=22" },
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
@@ -2123,7 +2123,7 @@ Globals:
   Function:
     Timeout: 900
     MemorySize: 1024
-    Runtime: nodejs20.x
+    Runtime: nodejs24.x
 
 Resources:
   DataBucket:
@@ -2172,7 +2172,7 @@ Resources:
       BuildMethod: esbuild
       BuildProperties:
         Format: esm
-        Target: node20
+        Target: node24
         EntryPoints: [src/handler.ts]
 
   SchedulerRole:
@@ -2499,7 +2499,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20", cache: npm }
+        with: { node-version: "24", cache: npm }
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
@@ -2544,7 +2544,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with: { node-version: "20", cache: npm }
+        with: { node-version: "24", cache: npm }
       - run: npm ci
       - run: npm run typecheck && npm test
       - uses: aws-actions/configure-aws-credentials@v4
