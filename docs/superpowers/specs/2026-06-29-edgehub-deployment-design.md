@@ -100,10 +100,12 @@ live at `history/<source>/ticker=<T>/current.json`. Each daily run reads the cac
 computes metrics, and rewrites the cache. The cache is **rebuildable from the immutable raw partitions**,
 which remain the source of truth — so this is an index/cache, not a second source of truth.
 
-**Calendar gate:** a minimal market calendar (`calendar.ts` + committed `config/calendar/holidays.json`)
-provides `isTradingDay` / `previousTradingDay`. The scheduled daily run **skips non-trading days**
-(manifest `SKIPPED`, `current` not advanced) so holidays don't produce garbage failures. (A full exchange
-calendar is Part 2.)
+**Calendar gate:** a minimal market calendar (`calendar.ts` + committed `config/calendar/holidays.json`
+with a `coveredYears` list) provides `isTradingDay` / `previousTradingDay` / `calendarCoversYear`. The
+scheduled daily run **skips non-trading days** (manifest `SKIPPED`, `current` not advanced). If the
+trading day's year isn't in `coveredYears`, the run **fails safely** (`FAILURE` / `calendar_year_missing`,
+`current` not advanced) rather than mis-treating real holidays — forcing a calendar-update PR each new
+year. (A full exchange calendar with half-days is Part 2.)
 
 This keeps daily runs fast and within provider rate limits, while still producing full metrics.
 
@@ -119,10 +121,15 @@ No code outside `providers/` knows which vendor is in use. The rest of the pipel
 export interface MarketDataProvider {
   readonly name: string;                 // e.g. "finnhub" — drives the raw/<source>/ path
   readonly version: string;              // reported sourceVersion
-  getLatestBars(date: string, tickers: string[]): Promise<VendorBar[]>; // exact-date only, no stale fallback
-  getHistory(ticker: string, lookbackDays: number): Promise<VendorBar[]>;
+  getLatestBars(date: string, tickers: string[]): Promise<ProviderResult>; // exact-date only, no stale fallback
+  getHistory(ticker: string, lookbackDays: number): Promise<ProviderResult>;
 }
+// ProviderResult = { bars: VendorBar[]; failures: ProviderFailure[] }
 ```
+
+**Per-ticker resilience:** providers return a `ProviderResult` — the bars they fetched **plus** a
+`ProviderFailure` for each ticker that errored or had no exact-date bar. A single failing symbol never
+throws and never aborts the batch. The pipeline records every failure (see Error handling).
 
 **Provider output vs stored row:** a provider returns `VendorBar` (vendor fields only). The pipeline
 enriches each into a `RawBarRow` (= `VendorBar` + full provenance: `runId, schemaVersion, metricVersion,
@@ -169,11 +176,13 @@ depends on, which version produced it, and which schema validated it.
 
 ## 5. AWS resources (`template.yaml`)
 
-- **S3 bucket** `edgehub-data` — **versioning ON**, top-level prefixes:
+- **S3 bucket** `edgehub-data-<accountId>-<region>` (suffixed for global uniqueness) — **versioning ON**, top-level prefixes:
   `raw/  metrics/  labels/  corporate_actions/  metadata/  reports/  errors/`
   (`labels/` and `corporate_actions/` are **reserved for Part 2 — created but unused in Part 1**, so
   later first-class data has a home without a migration).
-- **Lambda** `edgehub-daily-collector` — Node.js 20, **timeout 900s**, memory ~1024 MB.
+- **Lambda** `edgehub-daily-collector` — Node.js 20, **timeout 900s**, memory ~1024 MB,
+  **`ReservedConcurrentExecutions: 1`** (one run at a time — prevents overlapping runs racing on the
+  per-ticker history cache).
   Env vars: bucket name, region, `DATA_PROVIDER` (e.g. `finnhub`), `SCHEMA_VERSION`, `METRIC_VERSION`,
   `SOURCE_VERSION`, secret name. Switching vendors is a config/env change, not a code change.
 - **EventBridge Scheduler** (`AWS::Scheduler::Schedule`) — **`ScheduleExpressionTimezone: America/New_York`**,
@@ -218,6 +227,9 @@ corporate_actions/   (reserved, Part 2)
 - Glue partitions point at the date partition; consumers resolve the authoritative run via the
   `metadata/current` pointer. (Part 1 keeps partitioning **date-only**; a ticker partition or compacted
   history is a future optimization if Athena ticker-scans get slow.)
+- **Athena rerun rule:** because a date partition can hold multiple `runId`s, a naive date query returns
+  duplicate rows. Consumers MUST filter `WHERE runId = '<runId from metadata/current>'`. A consumer-friendly
+  `metrics_current/` (accepted run only) is a possible Part 2 convenience; immutable history stays in `metrics/`.
 
 ### Provenance fields (on every raw row, metric row, report, error file)
 
@@ -300,9 +312,11 @@ The universe changes over time (index reconstitutions, watchlist edits). For a b
   **Stored** with `qualityStatus=WARN` and populated `qualityIssues[]` so consumers can filter.
 - **OK** — passes all checks.
 
-Every failure/warning is recorded in `errors/...runId.../errors.json` and counted in the manifest.
-`qualityIssues` is stored as a **JSON-encoded string array** (not comma-joined), so issue codes parse
-cleanly downstream. Nothing is silently dropped.
+A dedicated `errors.ts` writes structured `ErrorRecord`s (`runId, tradingDay, source, universeVersion,
+ticker, reason, message, createdAt`) to `errors/...runId.../errors.json` — covering provider failures,
+`missing_bar_for_date`, REJECTED rows, WARN rows, pipeline errors, and `calendar_year_missing`. Counts
+roll up into the manifest. `qualityIssues` is stored as a **JSON-encoded string array** (not comma-joined),
+so issue codes parse cleanly downstream. Nothing is silently dropped.
 
 ---
 

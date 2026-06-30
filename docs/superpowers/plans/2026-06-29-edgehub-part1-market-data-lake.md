@@ -48,6 +48,7 @@
 | `src/historyCache.ts` | Per-ticker trailing-bar cache I/O |
 | `src/glue.ts` | Glue partition registration |
 | `src/metadata.ts` | Manifest + current pointer + universe snapshot |
+| `src/errors.ts` | Structured error-record writer (`errors/`) |
 | `src/report.ts` | Telegram report |
 | `src/pipeline.ts` | Orchestration, runId, manifest, current policy |
 | `src/handler.ts` | Lambda entrypoint |
@@ -205,6 +206,32 @@ export interface Provenance {
   universeVersion: string;
 }
 
+/** A per-ticker fetch failure — collected, never thrown, so one bad ticker can't kill the run. */
+export interface ProviderFailure {
+  ticker: string;
+  date: string;
+  reason: string;   // e.g. "provider_error" | "missing_bar_for_date"
+  message?: string;
+}
+
+/** Providers return found bars AND the failures, so the pipeline can record both. */
+export interface ProviderResult {
+  bars: VendorBar[];
+  failures: ProviderFailure[];
+}
+
+/** A single recorded error/warning written to errors/. */
+export interface ErrorRecord {
+  runId: string;
+  tradingDay: string;
+  source: string;
+  universeVersion: string;
+  ticker: string;
+  reason: string;   // provider_error | missing_bar_for_date | rejected | warn | pipeline_error | calendar_year_missing
+  message?: string;
+  createdAt: string;
+}
+
 /** Stored raw row = vendor bar enriched with full provenance by the pipeline. */
 export interface RawBarRow extends VendorBar {
   runId: string;
@@ -259,6 +286,7 @@ export interface RunManifest {
   metricVersion: string;
   schemaVersion: string;
   status: "SUCCESS" | "PARTIAL" | "FAILURE" | "SKIPPED";
+  note?: string; // reason for SKIPPED/FAILURE early-exit (e.g. "calendar_year_missing")
 }
 ```
 
@@ -439,7 +467,7 @@ describe("calendar", () => {
 
 ```json
 {
-  "version": "2026",
+  "coveredYears": ["2026"],
   "dates": [
     "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
     "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
@@ -448,12 +476,16 @@ describe("calendar", () => {
 }
 ```
 
+> When the year rolls over, add the next year's holidays + extend `coveredYears` in a PR. Until then the
+> pipeline fails *safely* on an uncovered year (Step 5b) rather than guessing.
+
 - [ ] **Step 4: Create `src/calendar.ts`**
 
 ```ts
 import holidays from "../config/calendar/holidays.json" with { type: "json" };
 
 const DEFAULT_HOLIDAYS = new Set<string>(holidays.dates);
+const DEFAULT_COVERED = new Set<string>(holidays.coveredYears);
 
 export function isWeekend(date: string): boolean {
   // Parse as UTC noon to avoid timezone rollover.
@@ -472,9 +504,30 @@ export function previousTradingDay(date: string, holidaySet: Set<string> = DEFAU
   } while (!isTradingDay(d.toISOString().slice(0, 10), holidaySet));
   return d.toISOString().slice(0, 10);
 }
+
+/** Guards against an uncovered year silently treating real holidays as trading days. */
+export function calendarCoversYear(date: string, coveredYears: Set<string> = DEFAULT_COVERED): boolean {
+  return coveredYears.has(date.slice(0, 4));
+}
 ```
 
 - [ ] **Step 5: Run tests to verify they pass** — Run: `npx vitest run tests/calendar.test.ts` — Expected: PASS (all three).
+
+- [ ] **Step 5b: Add the coverage test**
+
+Append to `tests/calendar.test.ts`:
+
+```ts
+import { calendarCoversYear } from "../src/calendar.js";
+
+describe("calendarCoversYear", () => {
+  const covered = new Set(["2026"]);
+  it("is true for a covered year", () => { expect(calendarCoversYear("2026-06-29", covered)).toBe(true); });
+  it("is false for an uncovered year", () => { expect(calendarCoversYear("2027-01-04", covered)).toBe(false); });
+});
+```
+
+Run: `npx vitest run tests/calendar.test.ts` — Expected: PASS (all five).
 
 - [ ] **Step 6: Commit**
 
@@ -580,7 +633,7 @@ git commit -m "feat: add versioned universe loader"
 **Files:** Create `src/providers/provider.ts`, `src/providers/factory.ts`, `src/providers/fake.ts`; Test `tests/provider-factory.test.ts`
 
 **Interfaces:**
-- `interface MarketDataProvider { readonly name: string; readonly version: string; getLatestBars(date, tickers): Promise<VendorBar[]>; getHistory(ticker, lookbackDays): Promise<VendorBar[]> }`. `getLatestBars` returns ONLY bars whose date equals the requested `date` (no stale fallback).
+- `interface MarketDataProvider { readonly name: string; readonly version: string; getLatestBars(date, tickers): Promise<ProviderResult>; getHistory(ticker, lookbackDays): Promise<ProviderResult> }`. `getLatestBars` returns ONLY bars whose date equals the requested `date` (no stale fallback) and records a `ProviderFailure` for any ticker with no exact-date bar or a fetch error.
 - `getProvider(name, secrets): MarketDataProvider`.
 - `class FakeProvider` constructed with `Map<string, VendorBar[]>`.
 
@@ -604,12 +657,15 @@ describe("FakeProvider.getLatestBars", () => {
   it("returns only the bar matching the requested date", async () => {
     const p = new FakeProvider(new Map([["AAPL", [bar("2026-06-26"), bar("2026-06-29")]]]));
     const out = await p.getLatestBars("2026-06-29", ["AAPL"]);
-    expect(out).toHaveLength(1);
-    expect(out[0]!.date).toBe("2026-06-29");
+    expect(out.bars).toHaveLength(1);
+    expect(out.bars[0]!.date).toBe("2026-06-29");
+    expect(out.failures).toEqual([]);
   });
-  it("returns nothing when the date is missing (no stale fallback)", async () => {
+  it("records a failure when the date is missing (no stale fallback)", async () => {
     const p = new FakeProvider(new Map([["AAPL", [bar("2026-06-26")]]]));
-    expect(await p.getLatestBars("2026-06-29", ["AAPL"])).toEqual([]);
+    const out = await p.getLatestBars("2026-06-29", ["AAPL"]);
+    expect(out.bars).toEqual([]);
+    expect(out.failures[0]).toMatchObject({ ticker: "AAPL", reason: "missing_bar_for_date" });
   });
 });
 ```
@@ -619,14 +675,14 @@ describe("FakeProvider.getLatestBars", () => {
 - [ ] **Step 3: Create `src/providers/provider.ts`**
 
 ```ts
-import type { VendorBar } from "../types.js";
+import type { ProviderResult } from "../types.js";
 
 export interface MarketDataProvider {
   readonly name: string;
   readonly version: string;
-  /** Returns ONLY bars whose date === the requested date. Empty if absent — never a stale bar. */
-  getLatestBars(date: string, tickers: string[]): Promise<VendorBar[]>;
-  getHistory(ticker: string, lookbackDays: number): Promise<VendorBar[]>;
+  /** Returns bars whose date === the requested date (never a stale bar) plus a failure per missing/errored ticker. */
+  getLatestBars(date: string, tickers: string[]): Promise<ProviderResult>;
+  getHistory(ticker: string, lookbackDays: number): Promise<ProviderResult>;
 }
 ```
 
@@ -634,24 +690,26 @@ export interface MarketDataProvider {
 
 ```ts
 import type { MarketDataProvider } from "./provider.js";
-import type { VendorBar } from "../types.js";
+import type { VendorBar, ProviderResult, ProviderFailure } from "../types.js";
 
 export class FakeProvider implements MarketDataProvider {
   readonly name = "fake";
   readonly version = "1.0";
   constructor(private readonly history: Map<string, VendorBar[]>) {}
 
-  async getLatestBars(date: string, tickers: string[]): Promise<VendorBar[]> {
-    const out: VendorBar[] = [];
+  async getLatestBars(date: string, tickers: string[]): Promise<ProviderResult> {
+    const bars: VendorBar[] = [];
+    const failures: ProviderFailure[] = [];
     for (const t of tickers) {
       const match = (this.history.get(t) ?? []).find((b) => b.date === date);
-      if (match) out.push(match);
+      if (match) bars.push(match);
+      else failures.push({ ticker: t, date, reason: "missing_bar_for_date" });
     }
-    return out;
+    return { bars, failures };
   }
 
-  async getHistory(ticker: string, lookbackDays: number): Promise<VendorBar[]> {
-    return (this.history.get(ticker) ?? []).slice(-lookbackDays);
+  async getHistory(ticker: string, lookbackDays: number): Promise<ProviderResult> {
+    return { bars: (this.history.get(ticker) ?? []).slice(-lookbackDays), failures: [] };
   }
 }
 ```
@@ -676,13 +734,13 @@ export function getProvider(name: string, secrets: Record<string, string>): Mark
 > `src/providers/finnhub.ts`:
 > ```ts
 > import type { MarketDataProvider } from "./provider.js";
-> import type { VendorBar } from "../types.js";
+> import type { ProviderResult } from "../types.js";
 > export class FinnhubProvider implements MarketDataProvider {
 >   readonly name = "finnhub";
 >   readonly version = "1.0";
 >   constructor(_token: string) {}
->   async getLatestBars(_d: string, _t: string[]): Promise<VendorBar[]> { throw new Error("not implemented"); }
->   async getHistory(_t: string, _n: number): Promise<VendorBar[]> { throw new Error("not implemented"); }
+>   async getLatestBars(_d: string, _t: string[]): Promise<ProviderResult> { throw new Error("not implemented"); }
+>   async getHistory(_t: string, _n: number): Promise<ProviderResult> { throw new Error("not implemented"); }
 > }
 > ```
 
@@ -735,7 +793,7 @@ describe("mapCandle", () => {
 
 ```ts
 import type { MarketDataProvider } from "./provider.js";
-import type { VendorBar } from "../types.js";
+import type { VendorBar, ProviderResult, ProviderFailure } from "../types.js";
 import { SOURCE_VERSION } from "../types.js";
 
 interface FinnhubCandle { s: string; t?: number[]; o?: number[]; h?: number[]; l?: number[]; c?: number[]; v?: number[]; }
@@ -789,22 +847,32 @@ export class FinnhubProvider implements MarketDataProvider {
     return mapCandle(symbol, await res.json(), new Date().toISOString());
   }
 
-  async getLatestBars(date: string, tickers: string[]): Promise<VendorBar[]> {
+  async getLatestBars(date: string, tickers: string[]): Promise<ProviderResult> {
     const to = Math.floor(new Date(`${date}T23:59:59Z`).getTime() / 1000);
     const from = to - 5 * 86400;
-    const out: VendorBar[] = [];
+    const bars: VendorBar[] = [];
+    const failures: ProviderFailure[] = [];
     for (const t of tickers) {
-      const bars = await this.candle(t, from, to);
-      const match = bars.find((b) => b.date === date); // exact date only — no stale fallback
-      if (match) out.push(match);
+      try {
+        const candles = await this.candle(t, from, to);
+        const match = candles.find((b) => b.date === date); // exact date only — no stale fallback
+        if (match) bars.push(match);
+        else failures.push({ ticker: t, date, reason: "missing_bar_for_date" });
+      } catch (err) {
+        failures.push({ ticker: t, date, reason: "provider_error", message: (err as Error).message });
+      }
     }
-    return out;
+    return { bars, failures }; // one bad ticker never aborts the batch
   }
 
-  async getHistory(ticker: string, lookbackDays: number): Promise<VendorBar[]> {
+  async getHistory(ticker: string, lookbackDays: number): Promise<ProviderResult> {
     const to = Math.floor(Date.now() / 1000);
     const from = to - Math.ceil(lookbackDays * 1.5) * 86400; // pad for weekends/holidays
-    return this.candle(ticker, from, to);
+    try {
+      return { bars: await this.candle(ticker, from, to), failures: [] };
+    } catch (err) {
+      return { bars: [], failures: [{ ticker, date: "", reason: "provider_error", message: (err as Error).message }] };
+    }
   }
 }
 ```
@@ -1498,6 +1566,80 @@ git commit -m "feat: add manifest, current pointer, and universe snapshot writer
 
 ---
 
+## Task 16b: Error sink
+
+**Files:** Create `src/errors.ts`; Test `tests/errors.test.ts`
+
+**Interfaces:**
+- `errorsKey(date, runId): string` → `errors/year=.../month=.../day=.../runId=.../errors.json`.
+- `writeErrors(s3, bucket, date, runId, errors: ErrorRecord[]): Promise<void>` — no-op when `errors` is empty. Records provider failures, `missing_bar_for_date`, rejected rows, warnings, and pipeline errors. Nothing is silently dropped.
+
+- [ ] **Step 1: Write the failing test**
+
+```ts
+// tests/errors.test.ts
+import { describe, it, expect } from "vitest";
+import { errorsKey, writeErrors } from "../src/errors.js";
+import type { ErrorRecord } from "../src/types.js";
+
+describe("errorsKey", () => {
+  it("builds the partitioned errors key", () => {
+    expect(errorsKey("2026-06-29", "20260629T223000Z")).toBe(
+      "errors/year=2026/month=06/day=29/runId=20260629T223000Z/errors.json");
+  });
+});
+
+describe("writeErrors", () => {
+  it("skips the PUT when there are no errors", async () => {
+    let called = false;
+    const s3 = { send: async () => { called = true; return {}; } } as never;
+    await writeErrors(s3, "b", "2026-06-29", "R", []);
+    expect(called).toBe(false);
+  });
+  it("PUTs the error records as JSON", async () => {
+    let body = "";
+    const s3 = { send: async (c: { input: { Body: string } }) => { body = c.input.Body; return {}; } } as never;
+    const errs: ErrorRecord[] = [{ runId: "R", tradingDay: "2026-06-29", source: "finnhub", universeVersion: "2026-06-29", ticker: "AAPL", reason: "provider_error", message: "HTTP 500", createdAt: "2026-06-29T22:30:00Z" }];
+    await writeErrors(s3, "b", "2026-06-29", "R", errs);
+    expect(JSON.parse(body)).toHaveLength(1);
+    expect(JSON.parse(body)[0].reason).toBe("provider_error");
+  });
+});
+```
+
+- [ ] **Step 2: Run test to verify it fails** — Run: `npx vitest run tests/errors.test.ts` — Expected: FAIL.
+
+- [ ] **Step 3: Create `src/errors.ts`**
+
+```ts
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import type { ErrorRecord } from "./types.js";
+
+export function errorsKey(date: string, runId: string): string {
+  const [year, month, day] = date.split("-") as [string, string, string];
+  return `errors/year=${year}/month=${month}/day=${day}/runId=${runId}/errors.json`;
+}
+
+export async function writeErrors(s3: S3Client, bucket: string, date: string, runId: string, errors: ErrorRecord[]): Promise<void> {
+  if (errors.length === 0) return;
+  await s3.send(new PutObjectCommand({
+    Bucket: bucket, Key: errorsKey(date, runId),
+    Body: JSON.stringify(errors, null, 2), ContentType: "application/json",
+  }));
+}
+```
+
+- [ ] **Step 4: Run tests to verify they pass** — Run: `npx vitest run tests/errors.test.ts` — Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add src/errors.ts tests/errors.test.ts
+git commit -m "feat: add structured error sink (errors/ writer)"
+```
+
+---
+
 ## Task 17: Telegram report
 
 **Files:** Create `src/report.ts`; Test `tests/report.test.ts`
@@ -1535,7 +1677,7 @@ import type { RunManifest } from "./types.js";
 type FetchFn = (url: string, init: { method: string; headers: Record<string, string>; body: string }) => Promise<{ ok: boolean; status: number }>;
 
 export function renderReport(m: RunManifest): string {
-  return [
+  const lines = [
     `EdgeHub Daily Update`,
     `Date: ${m.tradingDay}`,
     `Provider: ${m.provider}`,
@@ -1548,7 +1690,9 @@ export function renderReport(m: RunManifest): string {
     `Metric Version: ${m.metricVersion}`,
     `Runtime: ${m.runtimeSec}s`,
     `Status: ${m.status}`,
-  ].join("\n");
+  ];
+  if (m.note) lines.push(`Note: ${m.note}`);
+  return lines.join("\n");
 }
 
 export async function sendTelegram(botToken: string, chatId: string, text: string, fetchFn: FetchFn = fetch as unknown as FetchFn): Promise<void> {
@@ -1578,7 +1722,7 @@ git commit -m "feat: add Telegram report rendering and sending"
 - `makeRunId(now: Date): string` → `YYYYMMDDTHHMMSSZ`.
 - `enrichRaw(bar: VendorBar, ctx: { runId: string; universeVersion: string }): RawBarRow`.
 - `buildManifest(args): RunManifest` — status: `SKIPPED` when not a trading day; `FAILURE` when success rate < floor (0.90) or zero; `PARTIAL` when below requested but ≥ floor; `SUCCESS` when all requested produced rows.
-- `runPipeline(mode, deps): Promise<RunManifest>` where `Deps = { provider, s3, glue, bucket, database, tradingDay, now, readHistory, writeHistory, isTradingDay }`. Records `missing_bar_for_date` per ticker; never writes a stale today row; advances `current` only on `SUCCESS`/`PARTIAL`.
+- `runPipeline(mode, deps): Promise<RunManifest>` where `Deps = { provider, s3, glue, bucket, database, tradingDay, now, readHistory, writeHistory, isTradingDay, calendarCovers }`. Collects every per-ticker failure into `ErrorRecord[]` and writes them via `writeErrors`; fails safely (`FAILURE` / `calendar_year_missing`) when the year isn't covered; never writes a stale today row; advances `current` only on `SUCCESS`/`PARTIAL`.
 
 - [ ] **Step 1: Write the failing test (runId + manifest)**
 
@@ -1615,7 +1759,7 @@ describe("buildManifest", () => {
 import { S3Client } from "@aws-sdk/client-s3";
 import { GlueClient } from "@aws-sdk/client-glue";
 import type { MarketDataProvider } from "./providers/provider.js";
-import type { VendorBar, RawBarRow, MetricRow, RunManifest, RunMode, Provenance } from "./types.js";
+import type { VendorBar, RawBarRow, MetricRow, RunManifest, RunMode, Provenance, ErrorRecord } from "./types.js";
 import { SCHEMA_VERSION, RAW_SCHEMA_VERSION, METRIC_VERSION } from "./types.js";
 import { loadUniverse } from "./universe.js";
 import { gradeBar } from "./validate.js";
@@ -1624,6 +1768,7 @@ import { mergeHistory, hasEnoughHistory } from "./history.js";
 import { writeRaw, writeMetrics } from "./storage.js";
 import { addPartition } from "./glue.js";
 import { writeManifest, markCurrent, snapshotUniverse } from "./metadata.js";
+import { writeErrors } from "./errors.js";
 
 export function makeRunId(now: Date): string {
   return now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}/, "");
@@ -1662,6 +1807,7 @@ export interface Deps {
   readHistory: (ticker: string) => Promise<VendorBar[]>;
   writeHistory: (ticker: string, bars: VendorBar[]) => Promise<void>;
   isTradingDay: (date: string) => boolean;
+  calendarCovers: (date: string) => boolean;
 }
 
 const MIN_SESSIONS = 200;
@@ -1672,13 +1818,26 @@ export async function runPipeline(mode: RunMode, deps: Deps): Promise<RunManifes
   const runId = makeRunId(deps.now());
   const { tickers, universeVersion } = loadUniverse();
 
+  const earlyExit = (status: RunManifest["status"], note: string): RunManifest => ({
+    runId, mode, tradingDay: deps.tradingDay, provider: deps.provider.name, universeVersion,
+    symbolsRequested: tickers.length, symbolsSucceeded: 0, rowsWritten: 0, warnings: 0, rejected: 0,
+    missingBars: 0, runtimeSec: 0, metricVersion: METRIC_VERSION, schemaVersion: SCHEMA_VERSION, status, note,
+  });
+
+  // Fail safely if the calendar does not cover this year — never guess holidays.
+  if (mode === "daily" && !deps.calendarCovers(deps.tradingDay)) {
+    const manifest = earlyExit("FAILURE", "calendar_year_missing");
+    await writeManifest(deps.s3, deps.bucket, manifest);
+    await writeErrors(deps.s3, deps.bucket, deps.tradingDay, runId, [{
+      runId, tradingDay: deps.tradingDay, source: deps.provider.name, universeVersion, ticker: "*",
+      reason: "calendar_year_missing", createdAt: deps.now().toISOString(),
+    }]);
+    return manifest; // do NOT advance current
+  }
+
   // Calendar gate: skip non-trading days for scheduled daily runs.
   if (mode === "daily" && !deps.isTradingDay(deps.tradingDay)) {
-    const manifest: RunManifest = {
-      runId, mode, tradingDay: deps.tradingDay, provider: deps.provider.name, universeVersion,
-      symbolsRequested: tickers.length, symbolsSucceeded: 0, rowsWritten: 0, warnings: 0, rejected: 0,
-      missingBars: 0, runtimeSec: 0, metricVersion: METRIC_VERSION, schemaVersion: SCHEMA_VERSION, status: "SKIPPED",
-    };
+    const manifest = earlyExit("SKIPPED", "non_trading_day");
     await writeManifest(deps.s3, deps.bucket, manifest); // do NOT advance current
     return manifest;
   }
@@ -1692,36 +1851,56 @@ export async function runPipeline(mode: RunMode, deps: Deps): Promise<RunManifes
 
   const rawToStore: RawBarRow[] = [];
   const metricRows: MetricRow[] = [];
+  const errors: ErrorRecord[] = [];
   const seen = new Set<string>();
   let warnings = 0, rejected = 0, missingBars = 0;
+
+  const recordError = (ticker: string, reason: string, message?: string) =>
+    errors.push({ runId, tradingDay: deps.tradingDay, source: deps.provider.name, universeVersion, ticker, reason, message, createdAt: deps.now().toISOString() });
+
+  // Daily mode fetches all latest bars in one resilient batch call.
+  const latestByTicker = new Map<string, VendorBar>();
+  if (mode === "daily") {
+    const result = await deps.provider.getLatestBars(deps.tradingDay, tickers);
+    for (const b of result.bars) latestByTicker.set(b.ticker, b);
+    for (const f of result.failures) recordError(f.ticker, f.reason, f.message);
+  }
 
   for (const ticker of tickers) {
     try {
       let bars: VendorBar[];
       if (mode === "backfill") {
-        bars = await deps.provider.getHistory(ticker, LOOKBACK_DAYS);
+        const r = await deps.provider.getHistory(ticker, LOOKBACK_DAYS);
+        for (const f of r.failures) recordError(f.ticker || ticker, f.reason, f.message);
+        bars = r.bars;
+        if (bars.length === 0) { missingBars++; continue; }
       } else {
-        const latest = (await deps.provider.getLatestBars(deps.tradingDay, [ticker]))[0];
-        if (!latest) { missingBars++; continue; } // missing today's bar -> recorded failure, NO fake row
+        const latest = latestByTicker.get(ticker);
+        if (!latest) { missingBars++; continue; } // failure already recorded from the batch result
         const stored = await deps.readHistory(ticker);
         bars = mergeHistory(stored, latest);
         if (!hasEnoughHistory(bars, MIN_SESSIONS)) {
-          bars = mergeHistory(await deps.provider.getHistory(ticker, LOOKBACK_DAYS), latest);
+          const r = await deps.provider.getHistory(ticker, LOOKBACK_DAYS);
+          for (const f of r.failures) recordError(f.ticker || ticker, f.reason, f.message);
+          bars = mergeHistory(r.bars, latest);
         }
       }
-      // The current session must be exactly tradingDay (daily) or the last backfilled bar.
+
       const today = bars[bars.length - 1];
-      if (!today || (mode === "daily" && today.date !== deps.tradingDay)) { missingBars++; continue; }
+      if (!today || (mode === "daily" && today.date !== deps.tradingDay)) {
+        missingBars++; recordError(ticker, "missing_bar_for_date"); continue; // NO fake row
+      }
 
       const grade = gradeBar(today, seen); // single batch-level grading (shared seen set)
       rawToStore.push(enrichRaw(today, { runId, universeVersion }));
-      if (grade.status === "REJECTED") { rejected++; continue; }
-      if (grade.status === "WARN") warnings++;
+      if (grade.status === "REJECTED") { rejected++; recordError(ticker, "rejected", grade.issues.join(",")); continue; }
+      if (grade.status === "WARN") { warnings++; recordError(ticker, "warn", grade.issues.join(",")); }
 
       metricRows.push(computeMetrics(bars, prov, grade));
       await deps.writeHistory(ticker, bars); // refresh cache for next run
-    } catch {
-      continue; // per-ticker failure is non-fatal
+    } catch (err) {
+      recordError(ticker, "pipeline_error", (err as Error).message); // per-ticker failure is non-fatal
+      continue;
     }
   }
 
@@ -1733,6 +1912,7 @@ export async function runPipeline(mode: RunMode, deps: Deps): Promise<RunManifes
     await addPartition(deps.glue, deps.database, "daily_bars", deps.bucket, `raw/${deps.provider.name}/daily`, deps.tradingDay);
     await addPartition(deps.glue, deps.database, "daily_metrics", deps.bucket, "metrics/daily", deps.tradingDay);
   }
+  await writeErrors(deps.s3, deps.bucket, deps.tradingDay, runId, errors); // no-op if empty
 
   const runtimeSec = Math.round((deps.now().getTime() - start) / 1000);
   const manifest = buildManifest({
@@ -1779,7 +1959,7 @@ describe("runPipeline (backfill, fake provider)", () => {
       provider: new FakeProvider(hist), s3, glue, bucket: "b", database: "edgehub", tradingDay: "2025-01-05",
       now: () => new Date("2025-01-05T22:30:00Z"),
       readHistory: async () => [], writeHistory: async (t, bars) => { written.set(t, bars); },
-      isTradingDay: () => true,
+      isTradingDay: () => true, calendarCovers: () => true,
     });
     expect(m.status).toBe("SUCCESS");
     expect(m.rowsWritten).toBe(9);
@@ -1795,9 +1975,25 @@ describe("runPipeline (daily, non-trading day)", () => {
     const m = await runPipeline("daily", {
       provider: new FakeProvider(new Map()), s3, glue, bucket: "b", database: "edgehub", tradingDay: "2026-07-04",
       now: () => new Date("2026-07-04T22:30:00Z"),
-      readHistory: async () => [], writeHistory: async () => {}, isTradingDay: () => false,
+      readHistory: async () => [], writeHistory: async () => {}, isTradingDay: () => false, calendarCovers: () => true,
     });
     expect(m.status).toBe("SKIPPED");
+  });
+});
+
+describe("runPipeline (daily, uncovered calendar year)", () => {
+  it("fails safely with calendar_year_missing and does not advance current", async () => {
+    const calls: string[] = [];
+    const s3 = { send: async (c: { constructor: { name: string }, input?: { Key?: string } }) => { calls.push(c.input?.Key ?? c.constructor.name); return {}; } } as never;
+    const glue = { send: async () => ({}) } as never;
+    const m = await runPipeline("daily", {
+      provider: new FakeProvider(new Map()), s3, glue, bucket: "b", database: "edgehub", tradingDay: "2027-03-02",
+      now: () => new Date("2027-03-02T22:30:00Z"),
+      readHistory: async () => [], writeHistory: async () => {}, isTradingDay: () => true, calendarCovers: () => false,
+    });
+    expect(m.status).toBe("FAILURE");
+    expect(m.note).toBe("calendar_year_missing");
+    expect(calls.some((k) => k.includes("metadata/current"))).toBe(false); // current not advanced
   });
 });
 ```
@@ -1851,7 +2047,7 @@ import { getProvider } from "./providers/factory.js";
 import { loadSecrets } from "./secrets.js";
 import { runPipeline } from "./pipeline.js";
 import { readHistoryCache, writeHistoryCache } from "./historyCache.js";
-import { isTradingDay } from "./calendar.js";
+import { isTradingDay, calendarCoversYear } from "./calendar.js";
 import { renderReport, sendTelegram } from "./report.js";
 
 export function parseEvent(event: { mode?: string; tradingDay?: string }, now: Date): { mode: RunMode; tradingDay: string } {
@@ -1880,6 +2076,7 @@ export async function handler(event: { mode?: string; tradingDay?: string } = {}
     readHistory: (t) => readHistoryCache(s3, bucket, provider.name, t),
     writeHistory: (t, bars) => writeHistoryCache(s3, bucket, provider.name, t, bars),
     isTradingDay: (d) => isTradingDay(d),
+    calendarCovers: (d) => calendarCoversYear(d),
   });
 
   await sendTelegram(secrets.telegramBotToken!, secrets.telegramChatId!, renderReport(manifest));
@@ -1932,7 +2129,7 @@ Resources:
   DataBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: edgehub-data
+      BucketName: !Sub "edgehub-data-${AWS::AccountId}-${AWS::Region}"  # globally-unique
       VersioningConfiguration: { Status: Enabled }
 
   EdgeHubSecret:
@@ -1952,9 +2149,10 @@ Resources:
     Properties:
       FunctionName: edgehub-daily-collector
       Handler: src/handler.handler
+      ReservedConcurrentExecutions: 1   # one run at a time — prevents history-cache write races
       Environment:
         Variables:
-          BUCKET_NAME: edgehub-data
+          BUCKET_NAME: !Ref DataBucket
           GLUE_DATABASE: edgehub
           DATA_PROVIDER: finnhub
           SECRET_NAME: edgehub/secrets
@@ -1962,7 +2160,7 @@ Resources:
           METRIC_VERSION: "1.0"
           SOURCE_VERSION: "1.0"
       Policies:
-        - S3CrudPolicy: { BucketName: edgehub-data }
+        - S3CrudPolicy: { BucketName: !Ref DataBucket }
         - Statement:
             - Effect: Allow
               Action: [glue:BatchCreatePartition, glue:GetPartition, glue:GetTable]
@@ -1999,6 +2197,8 @@ Resources:
     Type: AWS::Scheduler::Schedule
     Properties:
       Name: edgehub-daily-630pm-et
+      # 6:30 PM ET per project-plan.md. If the vendor lags, missing bars are recorded and `current`
+      # is NOT advanced, so a too-early run is safe; bump to cron(30 19 ...) for 7:30 PM if lag recurs.
       ScheduleExpression: cron(30 18 ? * MON-FRI *)
       ScheduleExpressionTimezone: America/New_York
       FlexibleTimeWindow: { Mode: "OFF" }
@@ -2018,7 +2218,7 @@ Resources:
         PartitionKeys: [{ Name: year, Type: string }, { Name: month, Type: string }, { Name: day, Type: string }]
         Parameters: { classification: parquet }
         StorageDescriptor:
-          Location: s3://edgehub-data/raw/finnhub/daily/
+          Location: !Sub "s3://${DataBucket}/raw/finnhub/daily/"
           InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
           OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
           SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
@@ -2051,7 +2251,7 @@ Resources:
         PartitionKeys: [{ Name: year, Type: string }, { Name: month, Type: string }, { Name: day, Type: string }]
         Parameters: { classification: parquet }
         StorageDescriptor:
-          Location: s3://edgehub-data/metrics/daily/
+          Location: !Sub "s3://${DataBucket}/metrics/daily/"
           InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
           OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
           SerdeInfo: { SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe }
@@ -2178,6 +2378,32 @@ Identity & provenance: ticker, date, runId, source, sourceVersion, schemaVersion
 | qualityIssues | — | — | **JSON-encoded string array** of issue codes |
 
 Any metric is `null` when its window exceeds available history.
+
+## Querying rule (IMPORTANT — reruns)
+
+A date partition can contain **multiple `runId`s** (same-day reruns are immutable, not overwrites):
+
+```
+metrics/daily/year=2026/month=06/day=29/runId=R1/...
+metrics/daily/year=2026/month=06/day=29/runId=R2/...
+```
+
+A naive `SELECT ... WHERE year=... AND month=... AND day=...` returns **all** runs → duplicate rows.
+Consumers MUST resolve the accepted run from `metadata/current/daily_metrics/<...>.json` and filter:
+
+```sql
+SELECT * FROM edgehub.daily_metrics
+WHERE year='2026' AND month='06' AND day='29'
+  AND runId = '<runId from metadata/current>';
+```
+
+> Future convenience (Part 2, optional): a `metrics_current/` prefix holding only the accepted run per
+> day, so consumers can query without the runId filter. Immutable history stays in `metrics/`.
+
+## Adjustment caveat (repeat)
+
+Part 1 metrics are computed from **unadjusted** Finnhub candles. Splits/dividends can distort MAs,
+returns, and 52-week stats. True adjustment + corporate actions arrive in Part 2.
 ````
 
 - [ ] **Step 2: Create `docs/BOOTSTRAP.md`**
@@ -2239,9 +2465,11 @@ aws lambda invoke --function-name edgehub-daily-collector \
 
 In the Athena console (workgroup with an S3 results location set), run:
 ```sql
-SELECT ticker, close, ma200, return252d FROM edgehub.daily_metrics LIMIT 20;
+-- runId comes from metadata/current/daily_metrics/<...>.json (see Data Dictionary "Querying rule")
+SELECT ticker, close, ma200, return252d FROM edgehub.daily_metrics
+WHERE runId = '<runId from metadata/current>' LIMIT 20;
 ```
-Expect rows for the latest partition.
+Expect rows for the accepted run.
 ````
 
 - [ ] **Step 3: Commit**
@@ -2342,23 +2570,29 @@ git commit -m "ci: add OIDC deploy-on-main workflow"
 
 ## Self-Review
 
-**1. Spec + review-feedback coverage:**
-- VendorBar vs RawBarRow split (review #1) → Tasks 2, 6, 7, 18 (`enrichRaw`). ✓
-- No fake adjustedClose; `isAdjusted`/null (review #2) → Tasks 2, 7, 21. ✓
-- No stale-bar fallback; `missing_bar_for_date` (review #3) → Tasks 6, 7 (exact-date), 18 (missingBars). ✓
-- History cache replaces S3 scan (review #4) → Tasks 14, 18, 19. ✓
-- Market calendar (review #5) → Tasks 4, 18 (gate), 19. ✓
-- qualityIssues as JSON (review #6) → Tasks 11, 12, 21. ✓
-- Early Parquet smoke test (review #7) → Task 12. ✓
-- current advances only on SUCCESS/PARTIAL (review #8) → Tasks 16, 18. ✓
-- Duplicate detection at batch level, quality injected (medium #7) → Tasks 8, 9, 18. ✓
-- ATR ≥15-bar note (medium #8) → Tasks 3, 9, 21. ✓
+**1. Spec + review-feedback coverage (rounds 1–4):**
+- VendorBar vs RawBarRow split → Tasks 2, 6, 7, 18 (`enrichRaw`). ✓
+- No fake adjustedClose; `isAdjusted`/null → Tasks 2, 7, 21. ✓
+- No stale-bar fallback; `missing_bar_for_date` → Tasks 6, 7 (exact-date), 18. ✓
+- History cache replaces S3 scan → Tasks 14, 18, 19. ✓
+- Market calendar gate → Tasks 4, 18, 19. ✓
+- qualityIssues as JSON → Tasks 11, 12, 21. ✓
+- Early Parquet smoke test → Task 12. ✓
+- current advances only on SUCCESS/PARTIAL → Tasks 16, 18. ✓
+- Duplicate detection at batch level, quality injected → Tasks 8, 9, 18. ✓
+- ATR ≥15-bar note → Tasks 3, 9, 21. ✓
+- **Round 4 #1 — ProviderResult { bars, failures }; one bad ticker can't kill the run** → Tasks 2, 6, 7, 18. ✓
+- **Round 4 #2 — dedicated `errors.ts` writer; failures/rejects/warnings/missing recorded** → Task 16b, 18. ✓
+- **Round 4 #3 — Athena rerun rule (filter by metadata/current runId)** → Task 21 (data dictionary + bootstrap). ✓
+- **Round 4 #4 — calendar coverage guard (`calendar_year_missing` → FAILURE, no current advance)** → Tasks 4, 18, 19. ✓
+- **Round 4 #5 — ReservedConcurrentExecutions: 1** → Task 20. ✓
+- **Round 4 + — account/region-suffixed bucket name; 6:30 PM lag note** → Task 20. ✓
 - SAM/single Lambda/OIDC/us-east-1/metrics naming/Parquet/registry/Glue tables/Telegram/Scheduler → Tasks 20, 1, 23, 3, 11, 15, 17. ✓
 - Universe versioning + snapshot, runId immutability, manifest → Tasks 5, 16, 18. ✓
 
 **2. Placeholder scan:** No "TBD"/"add error handling"/"similar to Task N". Every code step shows complete code. ✓
 
-**3. Type consistency:** `VendorBar`/`RawBarRow`/`MetricRow`/`Provenance`/`RunManifest` defined in Task 2, used unchanged downstream. `MarketDataProvider` returns `VendorBar[]` consistently (Tasks 6/7/18/19). `computeMetrics(bars, prov, quality)` matches caller in Task 18. `gradeBar(bar, seen)` consistent Tasks 8/18. `readHistory`/`writeHistory`/`isTradingDay` in `Deps` (Task 18) match handler wiring (Task 19). runId paths identical in storage (11), metadata (16). ✓
+**3. Type consistency:** `VendorBar`/`RawBarRow`/`MetricRow`/`Provenance`/`RunManifest`/`ProviderResult`/`ProviderFailure`/`ErrorRecord` defined in Task 2, used unchanged downstream. `MarketDataProvider` returns `ProviderResult` consistently (Tasks 6/7/18). `computeMetrics(bars, prov, quality)` matches caller in Task 18. `gradeBar(bar, seen)` consistent Tasks 8/18. `Deps` fields `readHistory`/`writeHistory`/`isTradingDay`/`calendarCovers` (Task 18) match handler wiring (Task 19). `RunManifest.note` set by early-exits (Task 18) and rendered (Task 17). runId paths identical in storage (11), metadata (16), errors (16b). ✓
 
 **Note on reserved prefixes:** `labels/` and `corporate_actions/` need no task — S3 has no real folders; the first Part 2 write creates them. Documented, not omitted.
 
