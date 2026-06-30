@@ -15,7 +15,7 @@ and is treated as fixed. This document specifies **how it is built and deployed*
 | IaC / deploy framework | **AWS SAM** (`template.yaml` + `samconfig.toml`) |
 | Compute shape | **Option A** — single Lambda monolith, internally modular |
 | Language / runtime | **TypeScript** on **Node.js 20** Lambda |
-| Market data vendor | **Finnhub**, behind a swappable `MarketDataProvider` interface |
+| Market data vendor | **Finnhub** as the first impl; active vendor chosen by config (`DATA_PROVIDER` env var), swappable behind a `MarketDataProvider` interface — nothing vendor-specific is hardcoded |
 | GitHub → AWS auth | **OIDC** (no long-lived keys), deploys only from `main` |
 | AWS region | **us-east-1** |
 | Ticker universe | **Committed JSON files** in `config/universe/` |
@@ -51,8 +51,9 @@ EdgeHub/
 │   ├── pipeline.ts            # orchestrates the 9 steps, tracks RunStats, owns runId
 │   ├── universe.ts            # Step 1: load + merge/dedupe ticker lists
 │   ├── providers/
-│   │   ├── provider.ts        # MarketDataProvider interface
-│   │   └── finnhub.ts         # Finnhub impl with rate limiting (<=60/min)
+│   │   ├── provider.ts        # MarketDataProvider interface (the generic contract)
+│   │   ├── factory.ts         # getProvider(config) -> active impl, selected by DATA_PROVIDER
+│   │   └── finnhub.ts         # one concrete impl (rate-limited <=60/min); polygon.ts / tiingo.ts later
 │   ├── history.ts             # load trailing bars from S3 for feature computation
 │   ├── validate.ts            # Steps 3 & 8: data-quality rules -> qualityStatus
 │   ├── features.ts            # Step 5: ma/atr/returns/52w/flags
@@ -86,11 +87,36 @@ This keeps daily runs fast and within Finnhub rate limits, while still producing
 
 ---
 
+## 4b. Provider abstraction (vendor-agnostic)
+
+No code outside `providers/` knows which vendor is in use. The rest of the pipeline depends only on the
+`MarketDataProvider` interface.
+
+```ts
+// providers/provider.ts
+export interface MarketDataProvider {
+  readonly name: string;                 // e.g. "finnhub" — drives the raw/<source>/ path
+  getLatestBars(date: string, tickers: string[]): Promise<RawBar[]>;
+  getHistory(ticker: string, lookbackDays: number): Promise<RawBar[]>;
+}
+```
+
+- `providers/factory.ts` returns the active impl based on the `DATA_PROVIDER` config value
+  (default `finnhub`); the concrete file (`finnhub.ts`, later `polygon.ts` / `tiingo.ts`) is an
+  implementation detail behind it.
+- **Adding a vendor = drop one new file implementing the interface + set `DATA_PROVIDER`.** No changes
+  to the pipeline, storage, features, or paths.
+- The `source` / `sourceVersion` provenance fields and the `raw/<source>/` prefix are all taken from
+  `provider.name` / the provider's reported version — never a hardcoded string.
+
+---
+
 ## 5. AWS resources (`template.yaml`)
 
 - **S3 bucket** `edgehub-data` — **versioning ON**, folders `raw/ features/ metadata/ reports/ errors/`.
 - **Lambda** `edgehub-daily-collector` — Node.js 20, **timeout 900s**, memory ~1024 MB.
-  Env vars: bucket name, region, `SCHEMA_VERSION`, `FEATURE_VERSION`, `SOURCE_VERSION`, secret name.
+  Env vars: bucket name, region, `DATA_PROVIDER` (e.g. `finnhub`), `SCHEMA_VERSION`, `FEATURE_VERSION`,
+  `SOURCE_VERSION`, secret name. Switching vendors is a config/env change, not a code change.
 - **EventBridge Scheduler** (`AWS::Scheduler::Schedule`) — **`ScheduleExpressionTimezone: America/New_York`**,
   fires **6:30 PM ET on weekdays** (`cron(30 18 ? * MON-FRI *)` in that timezone). Using Scheduler (not a
   plain EventBridge rule with UTC cron) eliminates DST drift.
@@ -108,8 +134,12 @@ This keeps daily runs fast and within Finnhub rate limits, while still producing
 Plain S3 versioning is **not** the sole immutability guarantee. Every write goes under a unique `runId`
 (UTC timestamp, e.g. `20260629T223000Z`), and a `metadata/latest/` pointer records the last successful run.
 
+The `<source>` path segment is **derived from the active provider's `name`** (not hardcoded), so a
+Polygon/Tiingo run lands under its own prefix automatically:
+
 ```
-raw/finnhub/daily/year=2026/month=06/day=29/runId=20260629T223000Z/part.parquet
+raw/<source>/daily/year=2026/month=06/day=29/runId=20260629T223000Z/part.parquet
+   e.g. raw/finnhub/daily/...  or  raw/polygon/daily/...
 features/daily/year=2026/month=06/day=29/runId=20260629T223000Z/part.parquet
 metadata/latest/daily_features/year=2026/month=06/day=29.json   -> { runId, status, rowCount }
 reports/year=2026/month=06/day=29/runId=.../report.json
