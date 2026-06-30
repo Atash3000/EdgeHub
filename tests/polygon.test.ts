@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { mapAgg, PolygonProvider } from "../src/providers/polygon.js";
+import type { SecurityMasterRow } from "../src/types.js";
 
 describe("mapAgg", () => {
   it("maps an aggregate result to VendorBar", () => {
@@ -96,5 +97,41 @@ describe("PolygonProvider.getLatestBars", () => {
     const errProvider = new PolygonProvider("k", errFetch, 600000);
     const errRes = await errProvider.getLatestBars("2026-06-27", ["AAPL", "MSFT"]);
     expect(errRes.failures.every((f) => f.reason === "provider_error")).toBe(true);
+  });
+});
+
+describe("PolygonProvider.listSecurities", () => {
+  it("maps reference fields and assigns a FIGI-based instrumentId", async () => {
+    const fakeFetch = async (_url: string) => ({
+      ok: true, status: 200,
+      json: async () => ({ status: "OK", results: [{
+        ticker: "AAPL", name: "Apple Inc.", market: "stocks", locale: "us", type: "CS",
+        currency_name: "usd", cik: "0000320193", composite_figi: "BBG000B9XRY4",
+        share_class_figi: "BBG001S5N8V8", primary_exchange: "XNAS", active: true,
+        list_date: "1980-12-12", last_updated_utc: "2026-06-30T00:00:00Z",
+      }] }),
+    });
+    const provider = new PolygonProvider("k", fakeFetch, 600000);
+    const res = await provider.listSecurities("2026-06-30", ["AAPL"]);
+    expect(res.failures).toEqual([]);
+    expect(res.securities).toHaveLength(1);
+    const s = res.securities[0]!;
+    expect(s.ticker).toBe("AAPL");
+    expect(s.name).toBe("Apple Inc.");
+    expect(s.cik).toBe("0000320193");
+    expect(s.instrumentId).toBe("BBG001S5N8V8");
+    expect(s.identitySource).toBe("SHARE_CLASS_FIGI");
+    expect(s.referenceStatus).toBe("FOUND");
+    expect(s.active).toBe(true);
+    expect(s.asOfDate).toBe("2026-06-30");
+  });
+
+  it("returns a missing_reference_data failure when a ticker has no result", async () => {
+    const fakeFetch = async (_url: string) => ({ ok: true, status: 200, json: async () => ({ status: "OK", results: [] }) });
+    const provider = new PolygonProvider("k", fakeFetch, 600000);
+    const res = await provider.listSecurities("2026-06-30", ["ZZZZ"]);
+    expect(res.securities).toEqual([]);
+    expect(res.failures).toHaveLength(1);
+    expect(res.failures[0]).toMatchObject({ ticker: "ZZZZ", reason: "missing_reference_data" });
   });
 });
