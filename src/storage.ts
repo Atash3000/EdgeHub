@@ -1,5 +1,6 @@
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import { ParquetSchema, ParquetWriter } from "@dsnp/parquetjs";
+import { Writable } from "stream";
 import type { RawBarRow, MetricRow } from "./types.js";
 
 function parts(date: string): { year: string; month: string; day: string } {
@@ -44,9 +45,13 @@ export const METRIC_SCHEMA = new ParquetSchema({
 
 export async function toParquet(schema: ParquetSchema, rows: Record<string, unknown>[]): Promise<Buffer> {
   const chunks: Buffer[] = [];
-  const writer = await ParquetWriter.openStream(schema, {
-    write: (c: Buffer) => chunks.push(c), end: () => {},
-  } as never);
+  const stream = new Writable({
+    write(chunk, encoding, callback) {
+      chunks.push(chunk);
+      callback();
+    }
+  });
+  const writer = await ParquetWriter.openStream(schema, stream as never);
   for (const row of rows) await writer.appendRow(row);
   await writer.close();
   return Buffer.concat(chunks);
