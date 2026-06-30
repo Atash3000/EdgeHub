@@ -1,0 +1,11 @@
+import type { MarketDataProvider } from "./provider.js";
+import { FakeProvider } from "./fake.js";
+import { FinnhubProvider } from "./finnhub.js";
+
+export function getProvider(name: string, secrets: Record<string, string>): MarketDataProvider {
+  switch (name) {
+    case "finnhub": return new FinnhubProvider(secrets.finnhubToken ?? "");
+    case "fake": return new FakeProvider(new Map());
+    default: throw new Error(`Unknown data provider: ${name}`);
+  }
+}
