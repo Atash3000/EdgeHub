@@ -16,7 +16,12 @@ export function metricsKey(date: string, runId: string): string {
   return `metrics/daily/year=${year}/month=${month}/day=${day}/runId=${runId}/part.parquet`;
 }
 
-export const RAW_SCHEMA = new ParquetSchema({
+/** Stamp SNAPPY onto every column of a (flat) schema definition — cuts parquet size ~3-5x, transparent to readers. */
+function snappy<T extends Record<string, object>>(def: T): T {
+  return Object.fromEntries(Object.entries(def).map(([k, v]) => [k, { ...v, compression: "SNAPPY" }])) as T;
+}
+
+export const RAW_SCHEMA = new ParquetSchema(snappy({
   instrumentId: { type: "UTF8" },
   ticker: { type: "UTF8" }, date: { type: "UTF8" },
   open: { type: "DOUBLE" }, high: { type: "DOUBLE" }, low: { type: "DOUBLE" }, close: { type: "DOUBLE" },
@@ -24,9 +29,9 @@ export const RAW_SCHEMA = new ParquetSchema({
   volume: { type: "DOUBLE" },
   source: { type: "UTF8" }, sourceVersion: { type: "UTF8" }, ingestedAt: { type: "UTF8" },
   runId: { type: "UTF8" }, schemaVersion: { type: "UTF8" }, metricVersion: { type: "UTF8" }, universeVersion: { type: "UTF8" },
-});
+}));
 
-export const METRIC_SCHEMA = new ParquetSchema({
+export const METRIC_SCHEMA = new ParquetSchema(snappy({
   instrumentId: { type: "UTF8" },
   ticker: { type: "UTF8" }, date: { type: "UTF8" }, close: { type: "DOUBLE" }, dollarVolume: { type: "DOUBLE" },
   ma20: { type: "DOUBLE", optional: true }, ma50: { type: "DOUBLE", optional: true },
@@ -43,9 +48,9 @@ export const METRIC_SCHEMA = new ParquetSchema({
   qualityStatus: { type: "UTF8" }, qualityIssues: { type: "UTF8" },
   runId: { type: "UTF8" }, ingestedAt: { type: "UTF8" }, source: { type: "UTF8" }, sourceVersion: { type: "UTF8" },
   schemaVersion: { type: "UTF8" }, metricVersion: { type: "UTF8" }, universeVersion: { type: "UTF8" },
-});
+}));
 
-export const SECURITIES_SCHEMA = new ParquetSchema({
+export const SECURITIES_SCHEMA = new ParquetSchema(snappy({
   instrumentId: { type: "UTF8" }, ticker: { type: "UTF8" },
   tickerRoot: { type: "UTF8", optional: true }, tickerSuffix: { type: "UTF8", optional: true },
   name: { type: "UTF8", optional: true }, market: { type: "UTF8", optional: true },
@@ -58,16 +63,16 @@ export const SECURITIES_SCHEMA = new ParquetSchema({
   lastUpdatedUtc: { type: "UTF8", optional: true },
   identitySource: { type: "UTF8" }, identityConfidence: { type: "UTF8" }, referenceStatus: { type: "UTF8" },
   source: { type: "UTF8" }, sourceVersion: { type: "UTF8" }, asOfDate: { type: "UTF8" }, ingestedAt: { type: "UTF8" },
-});
+}));
 
-export const SYMBOL_ALIASES_SCHEMA = new ParquetSchema({
+export const SYMBOL_ALIASES_SCHEMA = new ParquetSchema(snappy({
   instrumentId: { type: "UTF8" }, ticker: { type: "UTF8" },
   tickerRoot: { type: "UTF8", optional: true }, tickerSuffix: { type: "UTF8", optional: true },
   primaryExchange: { type: "UTF8", optional: true },
   validFrom: { type: "UTF8" }, validTo: { type: "UTF8", optional: true },
   source: { type: "UTF8" }, sourceVersion: { type: "UTF8" }, asOfDate: { type: "UTF8" },
   confidence: { type: "UTF8" }, createdAt: { type: "UTF8" },
-});
+}));
 
 export function securitiesKey(asOfDate: string): string {
   return `reference/securities/asOf=${asOfDate}/part.parquet`;

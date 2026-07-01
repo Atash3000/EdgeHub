@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
-import { ParquetReader } from "@dsnp/parquetjs";
-import { toParquet, METRIC_SCHEMA } from "../src/storage.js";
+import { ParquetReader, ParquetSchema } from "@dsnp/parquetjs";
+import { toParquet, METRIC_SCHEMA, RAW_SCHEMA } from "../src/storage.js";
 
 describe("parquet round-trip", () => {
   it("writes two metric rows and reads them back with correct types", async () => {
@@ -21,5 +21,19 @@ describe("parquet round-trip", () => {
     expect(read[0]!.above20ma).toBe(true);
     expect(read[1]!.qualityStatus).toBe("WARN");
     expect(JSON.parse(read[1]!.qualityIssues as string)).toEqual(["zero_volume"]);
+  });
+
+  it("stamps SNAPPY compression on every column of the parquet schemas", () => {
+    for (const [name, f] of Object.entries(METRIC_SCHEMA.fields)) expect(f.compression, name).toBe("SNAPPY");
+    for (const [name, f] of Object.entries(RAW_SCHEMA.fields)) expect(f.compression, name).toBe("SNAPPY");
+  });
+
+  it("SNAPPY meaningfully shrinks repetitive data vs UNCOMPRESSED (self-calibrating)", async () => {
+    const plainSchema = new ParquetSchema({ id: { type: "UTF8", compression: "UNCOMPRESSED" }, v: { type: "DOUBLE", compression: "UNCOMPRESSED" } });
+    const snapSchema = new ParquetSchema({ id: { type: "UTF8", compression: "SNAPPY" }, v: { type: "DOUBLE", compression: "SNAPPY" } });
+    const rows = Array.from({ length: 5000 }, () => ({ id: "AAPL", v: 123.45 }));
+    const plain = await toParquet(plainSchema, rows as unknown as Record<string, unknown>[]);
+    const snap = await toParquet(snapSchema, rows as unknown as Record<string, unknown>[]);
+    expect(snap.length).toBeLessThan(plain.length / 2);
   });
 });
